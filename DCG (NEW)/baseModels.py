@@ -224,9 +224,19 @@ class NoiseScheduler():
         self.posterior_mean_coef1 = self.betas * torch.sqrt(self.alphas_bar_prev) / (1. - self.alphas_bar)
         self.posterior_mean_coef2 = (1. - self.alphas_bar_prev) * torch.sqrt(self.alphas) / (1. - self.alphas_bar)
 
+    def _as_index_tensor(self, t, device=None):
+        if torch.is_tensor(t):
+            idx = t.long()
+        else:
+            idx = torch.tensor(t, dtype=torch.long)
+
+        if device is not None:
+            idx = idx.to(device)
+        return idx
+
     def reconstruct_x0(self, x_t, t, noise):
-        # Ensure t is on the same device as the scheduler buffers (CPU) for indexing
-        t_idx = t.long().cpu()
+        # Ensure t is a tensor index for scheduler buffer lookup.
+        t_idx = self._as_index_tensor(t, device=self.sqrt_inv_alphas_bar.device).cpu()
         s1 = self.sqrt_inv_alphas_bar[t_idx].to(x_t.device)
         s2 = self.sqrt_inv_alphas_bar_minus_one[t_idx].to(x_t.device)
         s1 = s1.reshape(-1, 1)
@@ -234,8 +244,8 @@ class NoiseScheduler():
         return s1 * x_t - s2 * noise
 
     def q_posterior(self, x_0, x_t, t):
-        # Ensure t is on the same device as the scheduler buffers (CPU) for indexing
-        t_idx = t.long().cpu()
+        # Ensure t is a tensor index for scheduler buffer lookup.
+        t_idx = self._as_index_tensor(t, device=self.posterior_mean_coef1.device).cpu()
         s1 = self.posterior_mean_coef1[t_idx].to(x_0.device)
         s2 = self.posterior_mean_coef2[t_idx].to(x_t.device)
         s1 = s1.reshape(-1, 1)
@@ -244,15 +254,16 @@ class NoiseScheduler():
         return mu
 
     def get_variance(self, t, device):
-        if t == 0:
+        t_idx = self._as_index_tensor(t).item()
+        if t_idx == 0:
             return 0
 
-        variance = (self.betas[t] * (1. - self.alphas_bar_prev[t]) / (1. - self.alphas_bar[t])).to(device)
+        variance = (self.betas[t_idx] * (1. - self.alphas_bar_prev[t_idx]) / (1. - self.alphas_bar[t_idx])).to(device)
         variance = variance.clip(1e-20)
         return variance
 
     def step(self, model_output, timestep, sample):
-        t = timestep
+        t = self._as_index_tensor(timestep).item()
         pred_original_sample = self.reconstruct_x0(sample, t, model_output)
         pred_prev_sample = self.q_posterior(pred_original_sample, sample, t)
         variance = 0
