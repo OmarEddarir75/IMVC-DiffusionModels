@@ -53,3 +53,5 @@ Thumbs.db
 # !DCG (NEW)/**/*.md
 # !DMVG/**/*.md
 # !IMVCDC/**/*.md
+
+DMVG/models/
