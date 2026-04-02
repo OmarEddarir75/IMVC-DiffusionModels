@@ -225,15 +225,19 @@ class NoiseScheduler():
         self.posterior_mean_coef2 = (1. - self.alphas_bar_prev) * torch.sqrt(self.alphas) / (1. - self.alphas_bar)
 
     def reconstruct_x0(self, x_t, t, noise):
-        s1 = self.sqrt_inv_alphas_bar[t].to(x_t.device)
-        s2 = self.sqrt_inv_alphas_bar_minus_one[t].to(x_t.device)
+        # Ensure t is on the same device as the scheduler buffers (CPU) for indexing
+        t_idx = t.long().cpu()
+        s1 = self.sqrt_inv_alphas_bar[t_idx].to(x_t.device)
+        s2 = self.sqrt_inv_alphas_bar_minus_one[t_idx].to(x_t.device)
         s1 = s1.reshape(-1, 1)
         s2 = s2.reshape(-1, 1)
         return s1 * x_t - s2 * noise
 
     def q_posterior(self, x_0, x_t, t):
-        s1 = self.posterior_mean_coef1[t].to(x_0.device)
-        s2 = self.posterior_mean_coef2[t].to(x_t.device)
+        # Ensure t is on the same device as the scheduler buffers (CPU) for indexing
+        t_idx = t.long().cpu()
+        s1 = self.posterior_mean_coef1[t_idx].to(x_0.device)
+        s2 = self.posterior_mean_coef2[t_idx].to(x_t.device)
         s1 = s1.reshape(-1, 1)
         s2 = s2.reshape(-1, 1)
         mu = s1 * x_0 + s2 * x_t
