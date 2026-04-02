@@ -13,13 +13,13 @@ def _as_probabilities(view, temperature=1.0):
     return F.softmax(view / temperature, dim=1)
 
 
-def compute_joint(view1, view2, EPS=sys.float_info.epsilon):
+def compute_joint(z_fused, latents, EPS=EPS):
     """Compute a valid, symmetric joint probability matrix P."""
 
-    bn, k = view1.size()
-    assert (view2.size(0) == bn and view2.size(1) == k)
+    bn, k = z_fused.size()
+    assert (latents.size(0) == bn and latents.size(1) == k)
 
-    p_i_j = torch.matmul(view1.t(), view2) / float(bn)
+    p_i_j = torch.matmul(z_fused.t(), latents) / float(bn)
     p_i_j = (p_i_j + p_i_j.t()) / 2.0
     p_i_j = torch.clamp(p_i_j, min=EPS)
     p_i_j = p_i_j / torch.clamp(p_i_j.sum(), min=EPS)
@@ -27,27 +27,30 @@ def compute_joint(view1, view2, EPS=sys.float_info.epsilon):
     return p_i_j
 
 
-def MMI(view1, view2, lamb=1.0, temperature=1.0, EPS=sys.float_info.epsilon):
-    """Bounded MMI loss computed from probability views."""
-    _, k = view1.size()
-    view1_prob = _as_probabilities(view1, temperature)
-    view2_prob = _as_probabilities(view2, temperature)
-    p_i_j = compute_joint(view1_prob, view2_prob, EPS)
-    assert (p_i_j.size() == (k, k))
+def MMI(z_fused, latents, lamb=1.0, temperature=1.0, EPS=EPS):
+    """Mutual Information between latent representations, to maximize."""
+    _, k = z_fused.size()
+    z_fused_prob = _as_probabilities(z_fused, temperature)
+    z_prob       = _as_probabilities(latents, temperature)
+    
+    p_i_j = compute_joint(z_fused_prob, z_prob, EPS)  # joint distribution
+    assert p_i_j.size() == (k, k)
 
-    p_i = p_i_j.sum(dim=1, keepdim=True).expand(k, k)
-    p_j = p_i_j.sum(dim=0, keepdim=True).expand(k, k)
+    # marginal distributions
+    p_i = p_i_j.sum(dim=1, keepdim=True)
+    p_j = p_i_j.sum(dim=0, keepdim=True)
 
+    # clamp to avoid log(0)
     p_i_j = torch.clamp(p_i_j, min=EPS)
-    p_j = torch.clamp(p_j, min=EPS)
     p_i = torch.clamp(p_i, min=EPS)
+    p_j = torch.clamp(p_j, min=EPS)
 
+    # standard MI formula
     mi = p_i_j * (torch.log(p_i_j) - lamb * torch.log(p_j) - lamb * torch.log(p_i))
     mi = mi.sum()
     mi = mi / max(math.log(k), EPS)
 
     return -mi
-
 
 class InstanceLoss(nn.Module):
     """Instance-level contrast loss"""
@@ -62,7 +65,7 @@ class InstanceLoss(nn.Module):
 
     def mask_correlated_samples(self, batch_size):
         N = 2 * batch_size
-        mask = torch.ones((N, N))
+        mask = torch.ones((N, N), device=self.device)
         mask = mask.fill_diagonal_(0)
         for i in range(batch_size):
             mask[i, batch_size + i] = 0
@@ -103,7 +106,7 @@ class ClusterLoss(nn.Module):
 
     def mask_correlated_clusters(self, class_num):
         N = 2 * class_num
-        mask = torch.ones((N, N))
+        mask = torch.ones((N, N), device=self.device)
         mask = mask.fill_diagonal_(0)
         for i in range(class_num):
             mask[i, class_num + i] = 0
@@ -114,9 +117,11 @@ class ClusterLoss(nn.Module):
     def forward(self, c_i, c_j, alpha=1.0):
         p_i = c_i.sum(0).view(-1)
         p_i /= p_i.sum()
+        p_i = torch.clamp(p_i, min=EPS)
         ne_i = math.log(p_i.size(0)) + (p_i * torch.log(p_i)).sum()
         p_j = c_j.sum(0).view(-1)
         p_j /= p_j.sum()
+        p_j = torch.clamp(p_j, min=EPS)
         ne_j = math.log(p_j.size(0)) + (p_j * torch.log(p_j)).sum()
         ne_loss = ne_i + ne_j
 
@@ -138,3 +143,97 @@ class ClusterLoss(nn.Module):
         loss /= N
 
         return loss + alpha * ne_loss
+    
+
+def cross_view_loss_fn(latents, projectors):
+    loss, pairs = 0.0, 0
+    for i in range(len(latents)):
+        for j in range(len(latents)):
+            if i == j: continue
+            z_i_in_j = projectors[(i, j)](latents[i])
+            loss += F.mse_loss(z_i_in_j, latents[j].detach())
+            pairs += 1
+    return loss / pairs
+
+
+def high_conf_loss_fn(view_head, latents, mask, threshold=0.8):
+    """
+    KL-based high-confidence multi-view clustering loss.
+
+    Args:
+        view_head : shared ViewClusterHead
+        latents   : list of (B, latent_dim)
+        mask      : (B, n_views) 1=present, 0=missing
+        threshold : confidence threshold
+    """
+    n_views = len(latents)
+    device  = latents[0].device
+
+    view_probs = []
+    view_logits = []
+
+    # Forward pass (detach for target construction) 
+    for v in range(n_views):
+        present = mask[:, v].bool()
+
+        q = torch.zeros(latents[v].shape[0], view_head.net[-1].out_features, device=device)
+        logits = torch.zeros_like(q)
+
+        if present.sum() > 0:
+            q_v, logits_v = view_head(latents[v][present].detach())
+            q[present] = q_v
+            logits[present] = logits_v
+
+        view_probs.append(q)
+        view_logits.append(logits)
+
+    # (n_views, B, K)
+    stacked = torch.stack(view_probs, dim=0)
+
+    # Mask missing views
+    presence = mask.t().unsqueeze(-1).float()  # (n_views, B, 1)
+    stacked = stacked * presence
+
+    # Aggregate across views
+    q_agg = stacked.max(dim=0).values  # (B, K)
+
+    # Confidence filtering 
+    conf_score = q_agg.max(dim=1).values
+    sample_mask = conf_score >= threshold
+
+    if sample_mask.sum() == 0:
+        return torch.tensor(0.0, device=device)
+
+    # Build soft target P
+    p = q_agg ** 2
+    p = p / (p.sum(dim=1, keepdim=True) + 1e-8)
+
+    # KL loss across views 
+    loss = torch.tensor(0.0, device=device)
+    count = 0
+
+    for v in range(n_views):
+        valid = sample_mask & mask[:, v].bool()
+        if valid.sum() == 0:
+            continue
+
+        _, logits_v = view_head(latents[v][valid])
+
+        # more stable than log(q)
+        log_q_v = F.log_softmax(logits_v / view_head.temperature, dim=-1)
+
+        p_valid = p[valid]
+
+        loss += F.kl_div(log_q_v, p_valid, reduction='batchmean')
+        count += 1
+
+    return loss / max(count, 1)
+
+def reconstruction_loss_fn(recon_views, x_views, mask):
+    loss = 0.0
+    count = 0
+    for v in range(len(recon_views)):
+        if mask[:, v].sum() > 0:
+            loss += F.mse_loss(recon_views[v][mask[:, v] == 1], x_views[v][mask[:, v] == 1])
+            count += 1
+    return loss / max(count, 1)

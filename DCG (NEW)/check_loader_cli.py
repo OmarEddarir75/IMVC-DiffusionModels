@@ -10,7 +10,7 @@ mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)
 
 main_dir = str((repo / "DCG (NEW)").resolve())
-keys = ["cub", "landuse_21", "handwritten", "synthetic3d"]
+keys = ["cub", "landuse_21", "handwritten", "synthetic3d", "noisymnist"]
 
 print("main_dir=", main_dir)
 for k in keys:

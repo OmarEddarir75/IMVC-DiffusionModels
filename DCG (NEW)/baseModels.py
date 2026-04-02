@@ -2,6 +2,132 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+class Autoencoder(nn.Module):
+    """
+    AutoEncoder module for multi-view representation learning.
+    """
+
+    def __init__(self, encoder_dims, activation='silu', use_norm=True, dropout=0.0):
+        super(Autoencoder, self).__init__()
+
+        self.encoder_dims = encoder_dims
+        self.latent_dim = encoder_dims[-1]
+        self.use_norm = use_norm
+        self.dropout = dropout
+        self.activation_name = activation.lower()
+
+        def get_activation():
+            if self.activation_name == 'relu':
+                return nn.ReLU(inplace=True)
+            elif self.activation_name == 'leakyrelu':
+                return nn.LeakyReLU(0.2, inplace=True)
+            elif self.activation_name == 'tanh':
+                return nn.Tanh()
+            elif self.activation_name == 'sigmoid':
+                return nn.Sigmoid()
+            elif self.activation_name == 'silu':
+                return nn.SiLU()
+            else:
+                raise ValueError(f'Unknown activation: {activation}')
+
+        # encoder
+        encoder_layers = []
+        num_enc_layers = len(encoder_dims) - 1
+
+        for i in range(num_enc_layers):
+            in_dim = encoder_dims[i]
+            out_dim = encoder_dims[i + 1]
+
+            encoder_layers.append(nn.Linear(in_dim, out_dim))
+
+            if i < num_enc_layers - 1:
+                if self.use_norm:
+                    encoder_layers.append(nn.LayerNorm(out_dim))
+
+                encoder_layers.append(get_activation())
+
+                if self.dropout > 0:
+                    encoder_layers.append(nn.Dropout(self.dropout))
+
+        self.encoder_net = nn.Sequential(*encoder_layers)
+
+        # decoder
+        decoder_dims = list(reversed(encoder_dims))
+        decoder_layers = []
+        num_dec_layers = len(decoder_dims) - 1
+
+        for i in range(num_dec_layers):
+            in_dim = decoder_dims[i]
+            out_dim = decoder_dims[i + 1]
+
+            decoder_layers.append(nn.Linear(in_dim, out_dim))
+
+            if i < num_dec_layers - 1:
+                if self.use_norm:
+                    decoder_layers.append(nn.LayerNorm(out_dim))
+
+                decoder_layers.append(get_activation())
+
+                if self.dropout > 0:
+                    decoder_layers.append(nn.Dropout(self.dropout))
+
+        self.decoder_net = nn.Sequential(*decoder_layers)
+
+    def encode(self, x):
+        """
+        Encode input to latent space.
+        """
+        z = self.encoder_net(x)
+        z = torch.tanh(z)
+        return z
+
+    def decode(self, z):
+        """
+        Decode latent to input space.
+        """
+        x_hat = self.decoder_net(z)
+        return x_hat
+
+    def forward(self, x):
+        z = self.encode(x)
+        x_hat = self.decode(z)
+        return x_hat, z
+
+
+class AttentionLayer(nn.Module):
+    def __init__(self, latent_dim, n_views=2):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.n_views = n_views
+        self.mlp = nn.Sequential(
+            nn.Linear(latent_dim * n_views, latent_dim * n_views),
+            nn.LayerNorm(latent_dim * n_views),
+            nn.SiLU(),
+            nn.Linear(latent_dim * n_views, latent_dim * n_views),
+            nn.LayerNorm(latent_dim * n_views),
+            nn.SiLU(),
+            nn.Linear(latent_dim * n_views, n_views),
+        )
+        self.output_layer = nn.Sigmoid()
+
+    def forward(self, *views, tau=0.5, return_weights=False):
+        
+        assert len(views) == self.n_views, f"Expected {self.n_views} views, got {len(views)}"
+
+        for v in views:
+            assert v.shape[-1] == self.latent_dim, "Latent dim mismatch across views"
+
+        h = torch.cat(views, dim=-1)
+        act = self.output_layer(self.mlp(h))
+        w = F.softmax(act / tau, dim=-1)  # attention weights over views
+        stacked = torch.stack(views, dim=1)
+        shared = (stacked * w.unsqueeze(-1)).sum(dim=1)
+
+        if return_weights:
+            return shared, w
+
+        return shared
+
 
 class SinusoidalEmbedding(nn.Module):
     def __init__(self, size: int, scale: float = 1.0):
@@ -146,132 +272,106 @@ class NoiseScheduler():
 
     def __len__(self):
         return self.num_timesteps
+    
 
+class MissingViewImputer:
+    """
+    Uses trained UNets + NoiseScheduler to impute clean latent vectors
+    for samples where one or more views are missing.
+    Supports multiple UNets (one per view).
+    """
+    def __init__(self, unets, scheduler, device):
+        """
+        unets: list of UNets, one per view
+        scheduler: NoiseScheduler
+        device: torch device
+        """
+        self.unets = unets
+        self.scheduler = scheduler
+        self.device = device
+        self.n_views = len(unets)
 
-class Autoencoder(nn.Module):
-    """AutoEncoder module that projects features to latent space."""
+    @torch.no_grad()
+    def impute(self, z_observed, mask=None, n_steps=50, noise_level=0.3):
+        """
+        z_observed: (B, latent_dim) fused latent from observed views only
+        mask: (B, n_views) tensor, 1 if view present, 0 if missing
+        n_steps: number of reverse diffusion steps
+        noise_level: fraction of total timesteps to corrupt (0.0–1.0)
+        """
+        t_start = int(noise_level * self.scheduler.num_timesteps)
+        z_imputed = z_observed.clone()
+        imputed_sum = torch.zeros_like(z_observed)
+        imputed_count = torch.zeros(z_observed.size(0), 1, device=z_observed.device, dtype=z_observed.dtype)
 
-    def __init__(self, encoder_dim, activation='silu', use_norm=True):
-        super(Autoencoder, self).__init__()
-
-        self._dim = len(encoder_dim) - 1
-        self._activation = activation
-        self._use_norm = use_norm
-
-        def get_activation():
-            if self._activation.lower() == 'sigmoid':
-                return nn.Sigmoid()
-            elif self._activation.lower() == 'leakyrelu':
-                return nn.LeakyReLU(0.2, inplace=True)
-            elif self._activation.lower() == 'tanh':
-                return nn.Tanh()
-            elif self._activation.lower() == 'relu':
-                return nn.ReLU()
-            elif self._activation.lower() == 'silu':
-                return nn.SiLU()
+        for v, unet in enumerate(self.unets):
+            # Determine which samples are missing for this view
+            if mask is not None:
+                missing_idx = (mask[:, v] == 0).nonzero(as_tuple=True)[0]
+                if len(missing_idx) == 0:
+                    continue
             else:
-                raise ValueError(f'Unknown activation type {self._activation}')
+                missing_idx = torch.arange(z_observed.size(0), device=z_observed.device)
 
-        encoder_layers = []
-        for i in range(self._dim):
-            in_dim = encoder_dim[i]
-            out_dim = encoder_dim[i + 1]
+            x = z_observed[missing_idx].clone()
 
-            encoder_layers.append(nn.Linear(in_dim, out_dim))
+            # Initial corruption
+            noise = torch.randn_like(x)
+            t_tensor = torch.full((x.size(0),), t_start, device=self.device, dtype=torch.long)
+            x = self.scheduler.add_noise(x, noise, t_tensor, device=self.device)
 
-            if i < self._dim - 1:
-                if self._use_norm:
-                    encoder_layers.append(nn.LayerNorm(out_dim))
+            # Reverse diffusion
+            for t in reversed(range(t_start)):
+                t_tensor = torch.full((x.size(0),), t, device=self.device, dtype=torch.long)
+                noise_pred = unet(x, t_tensor.float())
+                x = self.scheduler.step(noise_pred, t, x)
 
-                encoder_layers.append(get_activation())
+            # Accumulate per-view imputations and blend once at the end.
+            imputed_sum[missing_idx] += x
+            imputed_count[missing_idx] += 1.0
 
-        self._encoder = nn.Sequential(*encoder_layers)
+        valid = imputed_count.squeeze(-1) > 0
+        if valid.any():
+            z_imputed[valid] = imputed_sum[valid] / imputed_count[valid]
 
-        decoder_dim = list(reversed(encoder_dim))
-        decoder_layers = []
-
-        for i in range(self._dim):
-            in_dim = decoder_dim[i]
-            out_dim = decoder_dim[i + 1]
-
-            decoder_layers.append(nn.Linear(in_dim, out_dim))
-
-            if i < self._dim - 1:
-                if self._use_norm:
-                    decoder_layers.append(nn.LayerNorm(out_dim))
-
-                decoder_layers.append(get_activation())
-
-        self._decoder = nn.Sequential(*decoder_layers)
-
-    def encoder(self, x):
-        latent = self._encoder(x)
-        latent = latent / (latent.norm(dim=1, keepdim=True) + 1e-8)
-        return latent
-
-    def decoder(self, latent):
-        x_hat = self._decoder(latent)
-        return x_hat
-
-    def forward(self, x):
-        latent = self.encoder(x)
-        x_hat = self.decoder(latent)
-        return x_hat, latent
+        return z_imputed
 
 
-class ClusterProject(nn.Module):
-    def __init__(self, latent_dim, n_clusters):
-        super(ClusterProject, self).__init__()
-        self._latent_dim = latent_dim
-        self._n_clusters = n_clusters
-
-        self.cluster_projector = nn.Sequential(
-            nn.Linear(self._latent_dim, self._latent_dim),
-            nn.LayerNorm(self._latent_dim),
-            nn.SiLU(),
-        )
-
-        self.cluster = nn.Sequential(
-            nn.Linear(self._latent_dim, self._n_clusters),
-            nn.Softmax(dim=-1)
-        )
-
-    def forward(self, x):
-        z = self.cluster_projector(x)
-        y = self.cluster(z)
-        return y, z
-
-
-class AttentionLayer(nn.Module):
-    def __init__(self, latent_dim, n_views=2):
+class CrossViewProjector(nn.Module):
+    """
+    Maps the latent of view i into the latent space of view j.
+    One projector per ordered pair (i→j). Enables cross_view_loss
+    without requiring views to share input dimensionality.
+    """
+    def __init__(self, latent_dim):
         super().__init__()
-        self.latent_dim = latent_dim
-        self.n_views = n_views
-        self.mlp = nn.Sequential(
-            nn.Linear(latent_dim * n_views, latent_dim * n_views),
-            nn.LayerNorm(latent_dim * n_views),
+        self.net = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim),
+            nn.LayerNorm(latent_dim),
             nn.SiLU(),
-            nn.Linear(latent_dim * n_views, latent_dim * n_views),
-            nn.LayerNorm(latent_dim * n_views),
-            nn.SiLU(),
+            nn.Linear(latent_dim, latent_dim),
         )
-        self.output_layer = nn.Linear(latent_dim * n_views, n_views)
 
-    def forward(self, *views, tau=10.0, return_weights=False):
-        
-        assert len(views) == self.n_views, f"Expected {self.n_views} views, got {len(views)}"
+    def forward(self, z):
+        return self.net(z)
 
-        for v in views:
-            assert v.shape[-1] == self.latent_dim, "Latent dim mismatch across views"
 
-        h = torch.cat(views, dim=-1)
-        act = self.output_layer(self.mlp(h))
-        e = F.softmax(act / tau, dim=-1)  # attention weights over views
-        fused = torch.zeros_like(views[0])
-        for i, v in enumerate(views):
-            fused = fused + e[:, i].unsqueeze(-1) * v
+class ViewClusterHead(nn.Module):
+    """
+    Lightweight per-view cluster projection head.
+    Each view develops its own assignment confidence independently.
+    """
+    def __init__(self, latent_dim, n_clusters, temperature=0.05):
+        super().__init__()
+        self.temperature = temperature
+        self.net = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim),
+            nn.SiLU(),
+            nn.Linear(latent_dim, n_clusters),
+        )
 
-        if return_weights:
-            return fused, e
-
-        return fused
+    def forward(self, z):
+        logits = self.net(z)
+        q = F.softmax(logits / self.temperature, dim=-1)
+        return q, logits
+    

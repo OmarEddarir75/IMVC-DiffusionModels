@@ -48,26 +48,28 @@ def load_data(config):
         X_list.append(mat['X'][0][1].astype('float32'))
         Y_list.append(np.squeeze(mat['gt']))
 
-    elif data_key in ['landuse_21', 'landuse_21_3view']:
+    elif data_key == 'landuse_21':
+        # Load the .mat file
         mat = sio.loadmat(_resolve_data_file(main_dir, 'LandUse-21.mat', dataset_root))
-        train_x = []
-        train_x.append(sparse.csr_matrix(mat['X'][0, 0]).toarray())  # 20
-        train_x.append(sparse.csr_matrix(mat['X'][0, 1]).toarray())  # 59
-        train_x.append(sparse.csr_matrix(mat['X'][0, 2]).toarray())  # 40
+
+        # Convert sparse views to dense arrays
+        train_x = [
+            sparse.csr_matrix(mat['X'][0, 0]).toarray(),  # 20 features
+            sparse.csr_matrix(mat['X'][0, 1]).toarray(),  # 59 features
+            sparse.csr_matrix(mat['X'][0, 2]).toarray(),  # 40 features
+        ]
+
+        # Randomly sample 2100 instances
         index = random.sample(range(train_x[0].shape[0]), 2100)
 
-        selected_views = config.get('selected_views')
-        if selected_views is None:
-            if data_key == 'landuse_21_3view':
-                selected_views = [0, 1, 2]
-            elif len(config.get('Autoencoder', {}).get('archs', [])) == 3:
-                selected_views = [0, 1, 2]
-            else:
-                selected_views = [1, 2]
+        # Determine which views to load
+        selected_views = config.get('selected_views', [0, 1, 2])  # default to all views
 
+        # Append selected views to X_list
         for view in selected_views:
-            x = train_x[view][index]
-            X_list.append(x)
+            X_list.append(train_x[view][index])
+
+        # Load labels
         y = np.squeeze(mat['Y']).astype('int')[index]
         Y_list.append(y)
 
@@ -90,7 +92,7 @@ def load_data(config):
         Y_list.append(np.squeeze(mat[y_key]))
 
     elif data_key == 'synthetic3d':
-        mat = sio.loadmat(_resolve_data_file(main_dir, 'synthetic3d.mat', dataset_root))
+        mat = sio.loadmat(_resolve_data_file(main_dir, 'Synthetic3d.mat', dataset_root))
         X_list.append(mat['X'][0][0].astype('float32')) #3
         X_list.append(mat['X'][1][0].astype('float32')) #3
         Y_list.append(np.squeeze(mat['Y']))

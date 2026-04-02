@@ -2,6 +2,8 @@
 
 # Ignore everything by default.
 *
+datasests/
+DMVG/data/
 
 # Keep this file tracked.
 !.gitignore
@@ -44,6 +46,7 @@ Thumbs.db
 *.tmp
 *.temp
 *.md
+**/checkpoints/
 
 # Keep markdown files inside explicitly published trees.
 # !DCG/**/*.md
