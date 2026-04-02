@@ -198,27 +198,6 @@ def train_phase2(
                     count += 1
             LI = LI / max(count, 1)
 
-            # LD: diffusion + contrastive
-            fully_observed = (batch_mask.sum(dim=1) == n_views)
-            LD = torch.tensor(0.0, device=device)
-            if fully_observed.sum() > 1:
-                z_clean = z_fused[fully_observed].detach()
-                noise = torch.randn_like(z_clean)
-                t = torch.randint(0, scheduler.num_timesteps, (z_clean.shape[0],), device=device)
-                diff_loss = 0.0
-                contrast_loss = 0.0
-                for v, unet in enumerate(unets):
-                    z_noisy = scheduler.add_noise(z_clean, noise, t, device=device)
-                    noise_pred = unet(z_noisy, t.float())
-                    diff_loss += F.mse_loss(noise_pred, noise)
-                    z_hat0 = scheduler.reconstruct_x0(z_noisy, t, noise_pred)
-                    instance_loss_fn = InstanceLoss(batch_size=z_clean.shape[0],
-                                                    temperature=contrastive_temp,
-                                                    device=device)
-                    contrast_loss += instance_loss_fn(z_clean, z_hat0)
-                LD = (diff_loss + contrast_loss) / n_views
-
-
             # LC: cluster-level consistency + high-confidence pseudo-label supervision
             cluster_loss = torch.tensor(0.0, device=device)
             cluster_pairs = 0
@@ -240,6 +219,26 @@ def train_phase2(
                 high_conf_loss = high_conf_loss_fn(view_head=view_head, latents=latents, mask=batch_mask, threshold=conf_threshold)
 
             LC = cluster_loss + 0.5 * high_conf_loss
+
+            # LD: diffusion + contrastive
+            fully_observed = (batch_mask.sum(dim=1) == n_views)
+            LD = torch.tensor(0.0, device=device)
+            if fully_observed.sum() > 1:
+                z_clean = z_fused[fully_observed].detach()
+                noise = torch.randn_like(z_clean)
+                t = torch.randint(0, scheduler.num_timesteps, (z_clean.shape[0],), device=device)
+                diff_loss = 0.0
+                contrast_loss = 0.0
+                for v, unet in enumerate(unets):
+                    z_noisy = scheduler.add_noise(z_clean, noise, t, device=device)
+                    noise_pred = unet(z_noisy, t.float())
+                    diff_loss += F.mse_loss(noise_pred, noise)
+                    z_hat0 = scheduler.reconstruct_x0(z_noisy, t, noise_pred)
+                    instance_loss_fn = InstanceLoss(batch_size=z_clean.shape[0],
+                                                    temperature=contrastive_temp,
+                                                    device=device)
+                    contrast_loss += instance_loss_fn(z_clean, z_hat0)
+                LD = (diff_loss + contrast_loss) / n_views
 
             # total loss
             loss = lamda_recon*LR + lamda_mmi*LI + lamda_diff*LD + lamda_cluster*LC

@@ -224,10 +224,10 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size',   type=int,   default=None, help='Batch size')
     parser.add_argument('--missing_rate', type=float, default=None, help='Rate of missing data')
 
-    parser.add_argument('--lamda_mmi',      type=float, default=1.0, help='Weight for MMI loss (default: 1.0)')
-    parser.add_argument('--lamda_diff',     type=float, default=1.0, help='Weight for diffusion loss (default: 1.0)')
-    parser.add_argument('--lamda_recon',    type=float, default=1.0, help='Weight for reconstruction loss (default: 1.0)')
-    parser.add_argument('--lamda_cluster',  type=float, default=1.0, help='Weight for cluster loss (default: 1.0)')
+    parser.add_argument('--lamda_mmi',      type=float, default=None, help='Weight for MMI loss')
+    parser.add_argument('--lamda_diff',     type=float, default=None, help='Weight for diffusion loss')
+    parser.add_argument('--lamda_recon',    type=float, default=None, help='Weight for reconstruction loss')
+    parser.add_argument('--lamda_cluster',  type=float, default=None, help='Weight for cluster loss')
 
     # Output
     parser.add_argument('--save_dir',     type=str,   default=None, help='Directory to save checkpoint (omit to skip saving)')
