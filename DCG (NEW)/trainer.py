@@ -213,32 +213,74 @@ def train_phase2(
             if cluster_pairs > 0: cluster_loss = cluster_loss / cluster_pairs
 
             # --- KL pseudo-label loss with warm-up ---
-            if epoch < 10:
-                high_conf_loss = torch.tensor(0.0, device=device)
-            else:
-                high_conf_loss = high_conf_loss_fn(view_head=view_head, latents=latents, mask=batch_mask, threshold=conf_threshold)
-
+            # if epoch < 10:
+            #     high_conf_loss = torch.tensor(0.0, device=device)
+            # else:
+            #     high_conf_loss = high_conf_loss_fn(view_head=view_head, latents=latents, mask=batch_mask, threshold=conf_threshold)
+            high_conf_loss = high_conf_loss_fn(view_head=view_head, latents=latents, mask=batch_mask, threshold=conf_threshold)
             LC = cluster_loss + 0.5 * high_conf_loss
 
             # LD: diffusion + contrastive
             fully_observed = (batch_mask.sum(dim=1) == n_views)
             LD = torch.tensor(0.0, device=device)
             if fully_observed.sum() > 1:
-                z_clean = z_fused[fully_observed].detach()
-                noise = torch.randn_like(z_clean)
-                t = torch.randint(0, scheduler.num_timesteps, (z_clean.shape[0],), device=device)
+                # Cache fully-observed latents once: (n_views, Bf, latent_dim)
+                full_latents = torch.stack([lat[fully_observed] for lat in latents], dim=0)
+                b_full = full_latents.shape[1]
+
+                # Conservative training settings for recovery branch.
+                paired_subset_size = min(32, b_full)
+                paired_idx = torch.randperm(b_full, device=device)[:paired_subset_size]
+                paired_latents = full_latents[:, paired_idx]
+                b_pair = paired_latents.shape[1]
+
                 diff_loss = 0.0
-                contrast_loss = 0.0
+                ce_loss = torch.tensor(0.0, device=device)
+                ce_pairs = 0
+                recov_target_loss = torch.tensor(0.0, device=device)
+                recov_targets = 0
+                instance_loss_fn = InstanceLoss(batch_size=b_pair, temperature=contrastive_temp, device=device)
+                t_vectors = [
+                    torch.full((b_pair,), tt, dtype=torch.long, device=device)
+                    for tt in reversed(range(len(scheduler)))
+                ]
+
                 for v, unet in enumerate(unets):
+                    # ICDM-like denoising loss uses available latent directly.
+                    z_clean = full_latents[v]
+                    noise = torch.randn_like(z_clean)
+                    t = torch.randint(0, scheduler.num_timesteps, (b_full,), device=device)
                     z_noisy = scheduler.add_noise(z_clean, noise, t, device=device)
                     noise_pred = unet(z_noisy, t.float())
                     diff_loss += F.mse_loss(noise_pred, noise)
-                    z_hat0 = scheduler.reconstruct_x0(z_noisy, t, noise_pred)
-                    instance_loss_fn = InstanceLoss(batch_size=z_clean.shape[0],
-                                                    temperature=contrastive_temp,
-                                                    device=device)
-                    contrast_loss += instance_loss_fn(z_clean, z_hat0)
-                LD = (diff_loss + contrast_loss) / n_views
+
+                    # Recover target view v from other views only (exclude v), trainable on a small paired subset.
+                    if n_views <= 1:
+                        continue
+                    other_latents = paired_latents[[u for u in range(n_views) if u != v]]
+                    z_target = paired_latents[v].detach()
+                    v_recov = other_latents.mean(dim=0).clone()
+                    for t_vec in t_vectors:
+                        v_d = unet(v_recov, t_vec.float())
+                        v_recov = scheduler.step(v_d, int(t_vec[0].item()), v_recov)
+
+                    if v_recov.size(0) > 0:
+                        recov_target_loss += F.mse_loss(v_recov, z_target)
+                        recov_targets += 1
+                        for u in range(n_views):
+                            if u == v:
+                                continue
+                            z_other = paired_latents[u].detach()
+                            ce_loss += instance_loss_fn(v_recov, z_other)
+                            ce_pairs += 1
+
+                diff_loss = diff_loss / n_views
+                if recov_targets > 0:
+                    recov_target_loss = recov_target_loss / recov_targets
+                if ce_pairs > 0:
+                    ce_loss = ce_loss / ce_pairs
+                # Keep cross-view contrastive as a lighter regularizer.
+                LD = diff_loss + recov_target_loss + 0.2 * ce_loss
 
             # total loss
             loss = lamda_recon*LR + lamda_mmi*LI + lamda_diff*LD + lamda_cluster*LC
@@ -254,7 +296,7 @@ def train_phase2(
             totals["LD"] += LD.item()
             n_batches += 1
 
-        if verbose and (epoch+1) % 10 == 0:
+        if verbose and (epoch+1) % 1 == 0:
             avg = {k:v/n_batches for k,v in totals.items()}
             print(f"[Phase2] Epoch {epoch+1}/{n_epochs} ==> LOSS={loss.item():.4f} | LR={avg['LR']:.4f}  LD={avg['LD']:.4f}  LI={avg['LI']:.4f}  LC={avg['LC']:.4f}")
 

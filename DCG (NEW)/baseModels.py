@@ -110,7 +110,7 @@ class AttentionLayer(nn.Module):
         )
         self.output_layer = nn.Sigmoid()
 
-    def forward(self, *views, tau=0.5, return_weights=False):
+    def forward(self, *views, tau=10.0, return_weights=False):
         
         assert len(views) == self.n_views, f"Expected {self.n_views} views, got {len(views)}"
 
@@ -376,7 +376,7 @@ class ViewClusterHead(nn.Module):
     Lightweight per-view cluster projection head.
     Each view develops its own assignment confidence independently.
     """
-    def __init__(self, latent_dim, n_clusters, temperature=0.05):
+    def __init__(self, latent_dim, n_clusters, temperature=1.0):
         super().__init__()
         self.temperature = temperature
         self.net = nn.Sequential(

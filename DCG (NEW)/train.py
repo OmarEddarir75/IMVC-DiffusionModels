@@ -146,21 +146,21 @@ def main(args):
     optimizer = build_optimizer(autoencoders, attention_layer, unets, view_head, lr=tr_cfg['lr'],)
 
     # Phase 1 — Warmup with reconstruction and MMI losses only (no clustering or diffusion losses yet). This allows the autoencoders and attention layer to learn good initial latent representations before introducing the more complex objectives.
-    phase1_epochs = max(1, tr_cfg['epoch'] // 4)   # ~25 % of total budget
-    print(f"=== Phase 1: Warmup ({phase1_epochs} epochs) ===")
-    train_phase1(
-        autoencoders=autoencoders, attention_layer=attention_layer, imputer=imputer,optimizer=optimizer, 
-        x_views=x_views, mask=mask, device=device, n_epochs=phase1_epochs, batch_size=tr_cfg['batch_size'], 
-        lamda_recon=tr_cfg.get('lamda_recon', 1.0), lamda_mmi=tr_cfg.get('lamda_mmi', 0.1), verbose=True,
-    )
+    # phase1_epochs = max(1, tr_cfg['epoch'] // 4)   # ~25 % of total budget
+    # print(f"=========================== Phase 1: Warmup ({phase1_epochs} epochs) ===========================")
+    # train_phase1(
+    #     autoencoders=autoencoders, attention_layer=attention_layer, imputer=imputer,optimizer=optimizer, 
+    #     x_views=x_views, mask=mask, device=device, n_epochs=phase1_epochs, batch_size=tr_cfg['batch_size'], 
+    #     lamda_recon=tr_cfg.get('lamda_recon', 1.0), lamda_mmi=tr_cfg.get('lamda_mmi', 0.1), verbose=True,
+    # )
 
     # Phase 2 — Joint training with clustering and diffusion losses
-    phase2_epochs = tr_cfg['epoch'] - phase1_epochs
-    print(f"\n=== Phase 2: Joint training ({phase2_epochs} epochs) ===")
+    # phase2_epochs = tr_cfg['epoch'] - phase1_epochs
+    # print(f"\n=========================== Phase 2: Joint training ({phase2_epochs} epochs) ===========================")
 
     train_phase2(
         autoencoders=autoencoders, attention_layer=attention_layer, unets=unets, scheduler=scheduler, imputer=imputer,
-        view_head=view_head, x_views=x_views, mask=mask, optimizer=optimizer, device=device, n_epochs=phase2_epochs,
+        view_head=view_head, x_views=x_views, mask=mask, optimizer=optimizer, device=device, n_epochs=tr_cfg['epoch'],
         batch_size=tr_cfg['batch_size'], n_clusters=tr_cfg['n_clusters'], lamda_recon=tr_cfg.get('lamda_recon', 1.0),
         lamda_mmi=tr_cfg.get('lamda_mmi', 1.0), lamda_diff=tr_cfg.get('lamda_diff', 1.0), lamda_cluster=tr_cfg.get('lamda_cluster', 1.0),
         mmi_temperature=1.0, conf_threshold=0.6, cluster_temperature=0.05, contrastive_temp=0.1, verbose=True,
@@ -178,7 +178,7 @@ def main(args):
     labels_np = labels if isinstance(labels, np.ndarray) else labels.numpy()
     y_pred, _ = get_cluster_sols(z_np, ClusterClass=KMeans, n_clusters=tr_cfg['n_clusters'], init_args={'n_init': 20})
     scores = evaluation(y_pred, labels_np)
-    print(f"  ACC={scores['accuracy']*100:.2f}%  NMI={scores['NMI']*100:.2f}%  ARI={scores['ARI']*100:.2f}%")
+    print(f"  ACC={scores['accuracy']:.4f}  NMI={scores['NMI']:.4f}  ARI={scores['ARI']:.4f}")
 
     # Save checkpoint
     if args.save_dir:
