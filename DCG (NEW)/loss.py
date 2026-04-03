@@ -75,6 +75,8 @@ class InstanceLoss(nn.Module):
 
     def forward(self, z_i, z_j):
         N = 2 * self.batch_size
+        z_i = F.normalize(z_i, dim=1, eps=EPS)
+        z_j = F.normalize(z_j, dim=1, eps=EPS)
         z = torch.cat((z_i, z_j), dim=0)
 
         sim = torch.matmul(z, z.T) / self.temperature
@@ -156,7 +158,7 @@ def cross_view_loss_fn(latents, projectors):
     return loss / pairs
 
 
-def high_conf_loss_fn(view_head, latents, mask, threshold=0.8):
+def high_conf_loss_fn(view_head, latents, mask, threshold=0.8, aggregation="entropy_weighted"):
     """
     KL-based high-confidence multi-view clustering loss.
 
@@ -194,8 +196,23 @@ def high_conf_loss_fn(view_head, latents, mask, threshold=0.8):
     presence = mask.t().unsqueeze(-1).float()  # (n_views, B, 1)
     stacked = stacked * presence
 
-    # Aggregate across views
-    q_agg = stacked.max(dim=0).values  # (B, K)
+    # Aggregate across views with a stable reducer.
+    if aggregation not in ("mean", "entropy_weighted"):
+        raise ValueError(f"Unknown aggregation: {aggregation}. Expected 'mean' or 'entropy_weighted'.")
+
+    if aggregation == "mean":
+        weights = presence
+    else:
+        # Lower entropy => higher confidence => larger weight.
+        k = stacked.shape[-1]
+        entropy = -(stacked.clamp_min(EPS) * torch.log(stacked.clamp_min(EPS))).sum(dim=-1, keepdim=True)
+        norm = max(math.log(k), EPS)
+        confidence = 1.0 - (entropy / norm)
+        confidence = torch.clamp(confidence, min=0.0)
+        weights = confidence * presence
+
+    weights = weights / weights.sum(dim=0, keepdim=True).clamp_min(EPS)
+    q_agg = (stacked * weights).sum(dim=0)
 
     # Confidence filtering 
     conf_score = q_agg.max(dim=1).values

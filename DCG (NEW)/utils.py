@@ -14,11 +14,11 @@ import numpy as np
 
 from baseModels import (Autoencoder, AttentionLayer, Unet, NoiseScheduler, MissingViewImputer, ViewClusterHead,)
 
-def build_optimizer(autoencoders, attention_layer, unets, view_head, lr):
+def build_optimizer(autoencoders, attention_layer, dfs, view_head, lr):
     params = itertools.chain(
         *[ae.parameters() for ae in autoencoders],
         attention_layer.parameters(),
-        *[unet.parameters() for unet in unets],
+        *[unet.parameters() for unet in dfs],
         view_head.parameters(),
     )
     return torch.optim.Adam(params, lr=lr)
@@ -47,7 +47,7 @@ def build_models(cfg, device):
     attention_layer = AttentionLayer(latent_dim, n_views=n_views).to(device)
 
     # Diffusion components (one Unet per view + shared noise scheduler)
-    unets = [
+    dfs = [
         Unet(
             emb_size=diff_cfg['emb_size'],      # matches `emb_size` argument
             time_emb=diff_cfg['time_type'],     # matches `time_emb` argument
@@ -57,15 +57,15 @@ def build_models(cfg, device):
     ]
     scheduler = NoiseScheduler(num_timesteps=ns_cfg['num_timesteps'], beta_schedule=ns_cfg['beta_schedule'],)
     
-    imputer = MissingViewImputer(unets, scheduler, device)
+    imputer = MissingViewImputer(dfs, scheduler, device)
 
     # Clustering head (shared across views)
     view_head = ViewClusterHead(latent_dim, n_clusters).to(device)
 
-    return (autoencoders, attention_layer, unets, scheduler, imputer, view_head,)
+    return (autoencoders, attention_layer, dfs, scheduler, imputer, view_head,)
 
 
-def get_mask(n_views, data_len, missing_rate, seed=None):
+def get_mask(n_views, data_len, missing_rate, seed=None, min_view_presence_ratio=0.05):
     """
     Generate an indicator matrix A for incomplete multi-view data.
 
@@ -95,10 +95,24 @@ def get_mask(n_views, data_len, missing_rate, seed=None):
         ones_indices = np.random.choice(n_views, ones_in_sample, replace=False)
         mask[i, ones_indices] = 1
 
+    min_presence = max(1, int(math.ceil(float(min_view_presence_ratio) * data_len)))
+    for v in range(n_views):
+        present_count = int(mask[:, v].sum())
+        if present_count >= min_presence:
+            continue
+
+        deficit = min_presence - present_count
+        candidates = np.where(mask[:, v] == 0)[0]
+        if len(candidates) == 0:
+            continue
+
+        chosen = np.random.choice(candidates, size=min(deficit, len(candidates)), replace=False)
+        mask[chosen, v] = 1
+
     return mask
 
 
-def prepare_inputs(x_list, missing_rate, device, seed=None):
+def prepare_inputs(x_list, missing_rate, device, seed=None, min_view_presence_ratio=0.05):
     """
     Prepare masked multi-view inputs for training.
 
@@ -116,7 +130,13 @@ def prepare_inputs(x_list, missing_rate, device, seed=None):
     n_samples = x_list[0].shape[0]
 
     # Generate mask
-    mask_np = get_mask(n_views, n_samples, missing_rate, seed=seed)
+    mask_np = get_mask(
+        n_views,
+        n_samples,
+        missing_rate,
+        seed=seed,
+        min_view_presence_ratio=min_view_presence_ratio,
+    )
 
     # Apply mask to each view and convert to torch tensor
     x_train_list = [

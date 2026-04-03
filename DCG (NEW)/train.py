@@ -31,10 +31,18 @@ import torch.nn as nn
 from sklearn.cluster import KMeans
 
 from datasets import load_data
+from trainer import train, get_embeddings
 from evaluation import evaluation, get_cluster_sols
-from trainer import train_phase1, train_phase2, get_embeddings
 from configure import get_default_config, _with_multiview_fields
-from utils import build_models, build_optimizer, prepare_inputs, set_run_seed
+from utils import (
+    build_models,
+    build_optimizer,
+    prepare_inputs,
+    set_run_seed,
+    build_metrics_path,
+    save_metrics_history_json,
+    save_metrics_history_csv,
+)
 
 
 # Config helpers
@@ -114,10 +122,15 @@ def main(args):
         cfg = build_custom_config(args)
     cfg = maybe_override(cfg, args)
     cfg['dataset'] = args.dataset
+    if args.source_mode is None:
+        args.source_mode = cfg['training'].get('source_mode', 'attention')
+    cfg['training']['source_mode'] = args.source_mode
+    cfg['training'].setdefault('min_view_presence_ratio', 0.1)
     if args.dataset_root:
         cfg['dataset_root'] = args.dataset_root
 
     tr_cfg = cfg['training']
+    source_mode = tr_cfg['source_mode']
     print(f"\nConfig:\n  dataset={args.dataset}")
     print(f"  views={len(cfg['Autoencoder']['archs'])}, "
           f"latent_dim={cfg['Autoencoder']['archs'][0][-1]}")
@@ -136,34 +149,31 @@ def main(args):
     for v, x in enumerate(x_list):
         print(f"  View {v}: shape={x.shape}")
 
-    x_views, mask = prepare_inputs(x_list, missing_rate=tr_cfg['missing_rate'], device=device, seed=tr_cfg.get('mask_seed'),)
+    x_views, mask = prepare_inputs(
+        x_list,
+        missing_rate=tr_cfg['missing_rate'],
+        device=device,
+        seed=tr_cfg.get('mask_seed'),
+        min_view_presence_ratio=tr_cfg.get('min_view_presence_ratio', 0.1),
+    )
     print(f"  Mask shape: {mask.shape}, "
           f"overall presence={mask.float().mean():.2%}\n")
 
     # Build models and optimizer
-    (autoencoders, attention_layer, unets, scheduler, imputer, view_head,) = build_models(cfg, device)
+    (autoencoders, attention_layer, dfs, scheduler, imputer, view_head,) = build_models(cfg, device)
 
-    optimizer = build_optimizer(autoencoders, attention_layer, unets, view_head, lr=tr_cfg['lr'],)
+    optimizer = build_optimizer(autoencoders, attention_layer, dfs, view_head, lr=tr_cfg['lr'],)
 
-    # Phase 1 — Warmup with reconstruction and MMI losses only (no clustering or diffusion losses yet). This allows the autoencoders and attention layer to learn good initial latent representations before introducing the more complex objectives.
-    # phase1_epochs = max(1, tr_cfg['epoch'] // 4)   # ~25 % of total budget
-    # print(f"=========================== Phase 1: Warmup ({phase1_epochs} epochs) ===========================")
-    # train_phase1(
-    #     autoencoders=autoencoders, attention_layer=attention_layer, imputer=imputer,optimizer=optimizer, 
-    #     x_views=x_views, mask=mask, device=device, n_epochs=phase1_epochs, batch_size=tr_cfg['batch_size'], 
-    #     lamda_recon=tr_cfg.get('lamda_recon', 1.0), lamda_mmi=tr_cfg.get('lamda_mmi', 0.1), verbose=True,
-    # )
+    # Training Phase — Joint training with clustering and diffusion losses
+    # print(f"\n=========================== Training Phase : Joint training ({tr_cfg['epoch']} epochs) ===========================")
 
-    # Phase 2 — Joint training with clustering and diffusion losses
-    # phase2_epochs = tr_cfg['epoch'] - phase1_epochs
-    # print(f"\n=========================== Phase 2: Joint training ({phase2_epochs} epochs) ===========================")
-
-    train_phase2(
-        autoencoders=autoencoders, attention_layer=attention_layer, unets=unets, scheduler=scheduler, imputer=imputer,
+    history_rows = train(
+        autoencoders=autoencoders, attention_layer=attention_layer, dfs=dfs, scheduler=scheduler, imputer=imputer,
         view_head=view_head, x_views=x_views, mask=mask, optimizer=optimizer, device=device, n_epochs=tr_cfg['epoch'],
         batch_size=tr_cfg['batch_size'], n_clusters=tr_cfg['n_clusters'], lamda_recon=tr_cfg.get('lamda_recon', 1.0),
         lamda_mmi=tr_cfg.get('lamda_mmi', 1.0), lamda_diff=tr_cfg.get('lamda_diff', 1.0), lamda_cluster=tr_cfg.get('lamda_cluster', 1.0),
-        mmi_temperature=1.0, conf_threshold=0.6, cluster_temperature=0.05, contrastive_temp=0.1, verbose=True,
+        mmi_temperature=1.0, conf_threshold=0.6, cluster_temperature=0.05, contrastive_temp=0.1,
+        source_mode=source_mode, return_history=True, verbose=True,
     )
 
         # Evaluation
@@ -172,6 +182,7 @@ def main(args):
     z_fused = get_embeddings(
         autoencoders=autoencoders, attention_layer=attention_layer, 
         x_views=x_views, mask=mask, device=device, imputer=imputer, batch_size=256,
+        source_mode=source_mode,
     )
         
     z_np = z_fused.detach().cpu().numpy()
@@ -180,9 +191,35 @@ def main(args):
     scores = evaluation(y_pred, labels_np)
     print(f"  ACC={scores['accuracy']:.4f}  NMI={scores['NMI']:.4f}  ARI={scores['ARI']:.4f}")
 
+    # Store final clustering metrics in history for downstream plotting/reporting.
+    if history_rows:
+        history_rows[-1]["accuracy"] = float(scores["accuracy"])
+        history_rows[-1]["NMI"] = float(scores["NMI"])
+        history_rows[-1]["ARI"] = float(scores["ARI"])
+
     # Save checkpoint
     if args.save_dir:
         os.makedirs(args.save_dir, exist_ok=True)
+
+        metrics_json_path = build_metrics_path(
+            args.save_dir, args.dataset, tr_cfg['missing_rate'], tr_cfg['seed'], ext='json'
+        )
+        metrics_csv_path = build_metrics_path(
+            args.save_dir, args.dataset, tr_cfg['missing_rate'], tr_cfg['seed'], ext='csv'
+        )
+        save_metrics_history_json(
+            metrics_json_path,
+            {
+                "history": history_rows,
+                "final_scores": {
+                    "accuracy": float(scores["accuracy"]),
+                    "NMI": float(scores["NMI"]),
+                    "ARI": float(scores["ARI"]),
+                },
+            },
+        )
+        save_metrics_history_csv(metrics_csv_path, history_rows)
+
         ckpt_path = os.path.join(
             args.save_dir,
             f"{args.dataset}_mr{tr_cfg['missing_rate']}_seed{tr_cfg['seed']}.pt",
@@ -191,10 +228,12 @@ def main(args):
             {
                 'autoencoders':          [ae.state_dict() for ae in autoencoders],
                 'attention_layer':       attention_layer.state_dict(),
-                'unets':                 [unet.state_dict() for unet in unets],
+                'dfs':                 [unet.state_dict() for unet in dfs],
                 'view_head':             view_head.state_dict(),
                 'config':                cfg,
+                'source_mode':           source_mode,
                 'metrics':               scores,
+                'history':               history_rows,
             },
             ckpt_path,
         )
@@ -228,6 +267,7 @@ if __name__ == '__main__':
     parser.add_argument('--lamda_diff',     type=float, default=None, help='Weight for diffusion loss')
     parser.add_argument('--lamda_recon',    type=float, default=None, help='Weight for reconstruction loss')
     parser.add_argument('--lamda_cluster',  type=float, default=None, help='Weight for cluster loss')
+    parser.add_argument('--source_mode',    type=str, choices=['mean', 'attention'], default=None, help='Source construction mode for diffusion/recovery (defaults to config value)')
 
     # Output
     parser.add_argument('--save_dir',     type=str,   default=None, help='Directory to save checkpoint (omit to skip saving)')

@@ -95,10 +95,13 @@ class Autoencoder(nn.Module):
 
 
 class AttentionLayer(nn.Module):
-    def __init__(self, latent_dim, n_views=2):
+    def __init__(self, latent_dim, n_views=2, default_tau=1.0, eps=1e-8, min_weight=0.0):
         super().__init__()
         self.latent_dim = latent_dim
         self.n_views = n_views
+        self.default_tau = float(default_tau)
+        self.eps = max(float(eps), 1e-12)
+        self.min_weight = float(min_weight)
         self.mlp = nn.Sequential(
             nn.Linear(latent_dim * n_views, latent_dim * n_views),
             nn.LayerNorm(latent_dim * n_views),
@@ -108,9 +111,8 @@ class AttentionLayer(nn.Module):
             nn.SiLU(),
             nn.Linear(latent_dim * n_views, n_views),
         )
-        self.output_layer = nn.Sigmoid()
 
-    def forward(self, *views, tau=10.0, return_weights=False):
+    def forward(self, *views, tau=None, return_weights=False, mask=None, min_weight=None):
         
         assert len(views) == self.n_views, f"Expected {self.n_views} views, got {len(views)}"
 
@@ -118,8 +120,45 @@ class AttentionLayer(nn.Module):
             assert v.shape[-1] == self.latent_dim, "Latent dim mismatch across views"
 
         h = torch.cat(views, dim=-1)
-        act = self.output_layer(self.mlp(h))
-        w = F.softmax(act / tau, dim=-1)  # attention weights over views
+        logits = self.mlp(h)
+
+        if tau is None:
+            tau = self.default_tau
+        tau = max(float(tau), self.eps)
+        logits = logits / tau
+
+        if mask is None:
+            avail = torch.ones_like(logits)
+        else:
+            # mask: (B, n_views) where 1 = present, 0 = missing
+            avail = mask.float()
+
+        # Guard against degenerate rows: if all views are masked, fall back to uniform availability.
+        avail_sum = avail.sum(dim=-1, keepdim=True)
+        avail = torch.where(avail_sum > 0, avail, torch.ones_like(avail))
+
+        # Stable masked softmax.
+        logits = logits - logits.max(dim=-1, keepdim=True).values
+        exp_logits = torch.exp(logits) * avail
+        denom = exp_logits.sum(dim=-1, keepdim=True).clamp_min(self.eps)
+        w = exp_logits / denom
+
+        # Epsilon smoothing over available views.
+        smooth = self.eps * avail
+        w = w + smooth
+
+        # Optional floor on available-view weights to avoid single-view collapse.
+        if min_weight is None:
+            min_weight = self.min_weight
+        if min_weight > 0:
+            avail_count = avail.sum(dim=-1, keepdim=True).clamp_min(1.0)
+            max_floor = (1.0 - self.eps) / avail_count
+            floor = torch.minimum(torch.full_like(w, float(min_weight)), max_floor)
+            w = torch.where(avail > 0, torch.maximum(w, floor), torch.zeros_like(w))
+
+        w = w * avail
+        w = w / w.sum(dim=-1, keepdim=True).clamp_min(self.eps)
+
         stacked = torch.stack(views, dim=1)
         shared = (stacked * w.unsqueeze(-1)).sum(dim=1)
 
@@ -291,63 +330,117 @@ class NoiseScheduler():
 
 class MissingViewImputer:
     """
-    Uses trained UNets + NoiseScheduler to impute clean latent vectors
-    for samples where one or more views are missing.
-    Supports multiple UNets (one per view).
+    Uses trained DFs + NoiseScheduler for diffusion operations:
+    - Predict noise (for training LD branch)
+    - Impute missing-view latents (for inference)
+    Supports multiple DFs (one per view).
     """
-    def __init__(self, unets, scheduler, device):
+    def __init__(self, dfs, scheduler, device):
         """
-        unets: list of UNets, one per view
+        dfs: list of DFs, one per view
         scheduler: NoiseScheduler
         device: torch device
         """
-        self.unets = unets
+        self.dfs = dfs
         self.scheduler = scheduler
         self.device = device
-        self.n_views = len(unets)
+        self.n_views = len(dfs)
+
+    def predict_noise(self, z_noisy, t, view_idx):
+        """
+        Predict noise for a given corrupted latent and timestep (for training).
+
+        Args:
+            z_noisy: (B, latent_dim) corrupted latent
+            t: (B,) timestep indices
+            view_idx: which UNet to use (0 to n_views-1)
+
+        Returns:
+            noise_pred: (B, latent_dim) predicted noise
+        """
+        unet = self.dfs[view_idx]
+        return unet(z_noisy, t.float())
+
+    def denoise_step(self, z_t, t, view_idx):
+        """
+        Single reverse-diffusion denoising step.
+
+        Args:
+            z_t: (B, latent_dim) noisy latent at timestep t
+            t: scalar or (B,) timestep
+            view_idx: which UNet to use (0 to n_views-1)
+
+        Returns:
+            z_prev: (B, latent_dim) denoised latent at t-1
+        """
+        if isinstance(t, int):
+            t_tensor = torch.full((z_t.size(0),), t, dtype=torch.long, device=self.device)
+        else:
+            t_tensor = t
+        noise_pred = self.predict_noise(z_t, t_tensor, view_idx)
+        z_prev = self.scheduler.step(noise_pred, int(t) if isinstance(t, int) else int(t[0].item()), z_t)
+        return z_prev
 
     @torch.no_grad()
-    def impute(self, z_observed, mask=None, n_steps=50, noise_level=0.3):
+    def impute(self, z_condition, mask=None, n_steps=50, noise_level=0.3):
         """
-        z_observed: (B, latent_dim) fused latent from observed views only
-        mask: (B, n_views) tensor, 1 if view present, 0 if missing
-        n_steps: number of reverse diffusion steps
-        noise_level: fraction of total timesteps to corrupt (0.0–1.0)
-        """
-        t_start = int(noise_level * self.scheduler.num_timesteps)
-        z_imputed = z_observed.clone()
-        imputed_sum = torch.zeros_like(z_observed)
-        imputed_count = torch.zeros(z_observed.size(0), 1, device=z_observed.device, dtype=z_observed.dtype)
+        Impute missing-view latents by diffusion reverse pass.
 
-        for v, unet in enumerate(self.unets):
-            # Determine which samples are missing for this view
+        Flow: condition (observed views) → corrupt → denoise → imputed
+
+        Args:
+            z_condition: latent conditioned on observed views (mean or attention aggregated)
+            mask: (B, n_views) indicating which views present (1) or missing (0)
+            n_steps: controls denoising horizon (max timestep to denoise from)
+            noise_level: fraction of num_timesteps to corrupt for initial noise
+        """
+        # Determine corruption level
+        t_start = int(noise_level * self.scheduler.num_timesteps)
+        if n_steps is not None:
+            t_start = min(t_start, int(n_steps))
+        t_start = max(0, min(t_start, self.scheduler.num_timesteps - 1))
+
+        z_imputed = z_condition.clone()
+        imputed_sum = torch.zeros_like(z_condition)
+        imputed_weight = torch.zeros(z_condition.size(0), 1, device=z_condition.device, dtype=z_condition.dtype)
+
+        if mask is not None:
+            view_reliability = mask.float().mean(dim=0).to(z_condition.dtype).clamp_min(1e-4)
+        else:
+            view_reliability = torch.ones(self.n_views, device=z_condition.device, dtype=z_condition.dtype)
+
+        # For each view, use its dedicated UNet to refine the condition
+        for v, _ in enumerate(self.dfs):
+            # Determine which samples are missing view v
             if mask is not None:
                 missing_idx = (mask[:, v] == 0).nonzero(as_tuple=True)[0]
                 if len(missing_idx) == 0:
                     continue
             else:
-                missing_idx = torch.arange(z_observed.size(0), device=z_observed.device)
+                missing_idx = torch.arange(z_condition.size(0), device=z_condition.device)
 
-            x = z_observed[missing_idx].clone()
+            # Diffusion reverse pass (condition → corrupted → denoised)
+            z_corrupted = z_condition[missing_idx].clone()
 
-            # Initial corruption
-            noise = torch.randn_like(x)
-            t_tensor = torch.full((x.size(0),), t_start, device=self.device, dtype=torch.long)
-            x = self.scheduler.add_noise(x, noise, t_tensor, device=self.device)
+            # Corrupt the condition at t_start
+            noise = torch.randn_like(z_corrupted)
+            t_tensor = torch.full((z_corrupted.size(0),), t_start, device=self.device, dtype=torch.long)
+            z_corrupted = self.scheduler.add_noise(z_corrupted, noise, t_tensor, device=self.device)
 
-            # Reverse diffusion
+            # Denoise: reverse from t_start down to 0
+            z_denoised = z_corrupted
             for t in reversed(range(t_start)):
-                t_tensor = torch.full((x.size(0),), t, device=self.device, dtype=torch.long)
-                noise_pred = unet(x, t_tensor.float())
-                x = self.scheduler.step(noise_pred, t, x)
+                z_denoised = self.denoise_step(z_denoised, t, v)
 
-            # Accumulate per-view imputations and blend once at the end.
-            imputed_sum[missing_idx] += x
-            imputed_count[missing_idx] += 1.0
+            # Accumulate per-view imputations
+            w_v = view_reliability[v]
+            imputed_sum[missing_idx] += w_v * z_denoised
+            imputed_weight[missing_idx] += w_v
 
-        valid = imputed_count.squeeze(-1) > 0
+        # Blend imputations across views by reliability-weighted averaging.
+        valid = imputed_weight.squeeze(-1) > 0
         if valid.any():
-            z_imputed[valid] = imputed_sum[valid] / imputed_count[valid]
+            z_imputed[valid] = imputed_sum[valid] / imputed_weight[valid].clamp_min(1e-8)
 
         return z_imputed
 
