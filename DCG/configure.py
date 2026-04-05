@@ -1,170 +1,208 @@
 def get_default_config(data_name):
-    if data_name in ['Synthetic3d']:
-        return dict(
-            Autoencoder=dict(
-                arch1=[3, 1024, 1024, 1024, 128],
-                arch2=[3, 1024, 1024, 1024, 128],
-                activations1='relu',
-                activations2='relu',
-                batchnorm=True,
-            ),
-            training=dict(
-                seed=6,
-                mask_seed=5,
-                missing_rate=0.3,
-                batch_size=256,
-                epoch=200,
-                lr=1.0e-4,
-                lambda1=1,
-                lambda2=0.1,
-                n_clusters=3,
-            ),
-            diffusion=dict(
-                emb_size=128,
-                time_type="sinusoidal",
-                out_dim1=128,
-                out_dim2=128,
-            ),
-            noise_scheduler=dict(
-                num_timesteps= 100,
-                beta_schedule="linear",
-            ),
-        )
-    
+    # Shared defaults
+    base_config = dict(
+        Autoencoder=dict(
+            batchnorm=True,
+        ),
+        training=dict(
+            seed=0,
+            mask_seed=5,
+            missing_rate=0.3,
+            noise_scale=0.1,
+            batch_size=256,
+            epoch=200,
+            lr=1e-4,
 
-    elif data_name in ['HandWritten']:
-        return dict(
+            # loss weights
+            rec_weight=1.0,
+            mmi_weight=1.0,
+            diff_weight=1.0,
+            cluster_weight=0.1,
+            hc_weight=0.1,
+            ce_weight=1.0,
+            
+            # optional
+            n_eval=1, # default 1
+            save_eval_checkpoint=False,
+        ),
+        diffusion=dict(
+            emb_size=128,
+            time_type="sinusoidal",
+        ),
+        noise_scheduler=dict(
+            num_timesteps=100,
+            beta_schedule="linear",
+        ),
+    )
+
+    # Dataset-specific overrides
+    configs = {
+        'Synthetic3d': dict(
             Autoencoder=dict(
-                arch1=[76, 1024, 1024, 1024, 128],
-                arch2=[64, 1024, 1024, 1024, 128],
-                activations1='relu',
-                activations2='relu',
-                batchnorm=True,
+                archs=[[3, 1024, 1024, 1024, 128]] * 2,
+                activations=['silu', 'silu'],
             ),
             training=dict(
                 seed=6,
-                mask_seed=5,
-                missing_rate=0.3,
-                batch_size=256,
+                n_clusters=3,
                 epoch=200,
-                lr=1.0e-4,
-                lambda1=1,
-                lambda2=0.1,
+                save_eval_checkpoint=True,
+            ),
+        ),
+
+        'NoisyMNIST': dict(
+            Autoencoder=dict(
+                archs=[[784, 1024, 1024, 1024, 128]] * 2,
+                activations=['relu', 'relu'],
+            ),
+            training=dict(
+                seed=2,
+                mmi_weight=10.0,
                 n_clusters=10,
             ),
-            diffusion=dict(
-                emb_size=128,
-                time_type="sinusoidal",
-                out_dim1=128,
-                out_dim2=128,
+
+        ),
+
+        'MNIST-USPS': dict(
+            Autoencoder=dict(
+                archs=[
+                    [784, 1024, 1024, 1024, 128],
+                    [256, 1024, 1024, 1024, 128],
+                ],
+                activations=['relu', 'relu'],
+            ),
+            training=dict(
+                seed=2,
+                mmi_weight=10.0,
+                n_clusters=10,
+                batch_size=128,
+            ),
+        ),
+
+        'Caltech101': dict(
+            Autoencoder=dict(
+                archs=[
+                    [1024, 512, 1024, 1024, 128],
+                    [300, 512, 1024, 1024, 128],
+                ],
+                activations=['sigmoid', 'relu'],
+            ),
+            training=dict(
+                seed=8,
+                missing_rate=0.5,
+                mmi_weight=0.1,
+                cluster_weight=0.1,
+                hc_weight=0.1,
+                n_clusters=10,
+                alpha=9,
+            ),
+        ),
+
+        'Scene-15': dict(
+            Autoencoder=dict(
+                archs=[
+                    [512, 256, 1024, 1024, 128],
+                    [300, 256, 1024, 1024, 128],
+                ],
+                activations=['sigmoid', 'relu'],
+            ),
+            training=dict(
+                seed=8,
+                missing_rate=0.5,
+                mmi_weight=0.1,
+                cluster_weight=0.1,
+                hc_weight=0.1,
+                n_clusters=15,
+                alpha=9,
+            ),
+        ),
+
+        'HandWritten': dict(
+            Autoencoder=dict(
+                archs=[
+                    [76, 1024, 1024, 1024, 128],
+                    [64, 1024, 1024, 1024, 128],
+                ],
+                activations=['relu', 'relu'],
+            ),
+            training=dict(
+                seed=6,
+                n_clusters=10,
             ),
             noise_scheduler=dict(
                 num_timesteps=200,
-                beta_schedule="linear",
             ),
-        )
-    elif data_name in ['Multi-Fashion']:
-        return dict(
+        ),
+
+        'Multi-Fashion': dict(
             Autoencoder=dict(
-                arch1=[784, 1024, 1024, 1024, 128],
-                arch2=[784, 1024, 1024, 1024, 128],
-                activations1='relu',
-                activations2='relu',
-                batchnorm=True,
+                archs=[[784, 1024, 1024, 1024, 128]] * 2,
+                activations=['relu', 'relu'],
             ),
             training=dict(
-                missing_rate=0.3,
                 seed=2,
-                mask_seed=5,
-                batch_size=256,
-                epoch=200,
-                lr=1.0e-4,
-                lambda1=10.0,
-                lambda2=0.1,
+                mmi_weight=10.0,
                 n_clusters=10,
-            ),
-            diffusion=dict(
-                emb_size=128,
-                time_type="sinusoidal",
-                out_dim1=128,
-                out_dim2=128,
             ),
             noise_scheduler=dict(
                 num_timesteps=50,
-                beta_schedule="linear",
             ),
-        )
-    elif data_name in ['CUB']:
-        """The default configs."""
-        return dict(
+        ),
+
+        'CUB': dict(
             Autoencoder=dict(
-                arch1=[1024, 512, 1024, 1024, 128],
-                arch2=[300, 512, 1024, 1024, 128],
-                activations1='sigmoid',
-                activations2='relu',
-                batchnorm=True,
+                archs=[
+                    [1024, 512, 1024, 1024, 128],
+                    [300, 512, 1024, 1024, 128],
+                ],
+                activations=['sigmoid', 'relu'],
             ),
             training=dict(
-                missing_rate=0.5,
                 seed=8,
-                mask_seed=5,
-                batch_size=256,
-                epoch=200,
-                lr=1e-4,
-                num=10,
-                dim=256,
-                alpha=9,
-                lambda1=0.1,
-                lambda2=0.1,
+                missing_rate=0.5,
+                mmi_weight=0.1,
+                cluster_weight=0.1,
+                hc_weight=0.1,
                 n_clusters=10,
+                alpha=9,
             ),
-            diffusion=dict(
-                emb_size=128,
-                time_type="sinusoidal",
-                out_dim1=128,
-                out_dim2=128,
-            ),
-            noise_scheduler=dict(
-                num_timesteps=100,
-                beta_schedule="linear",
-            ),
-        )
-    
-    elif data_name in ['LandUse_21']:
-        """The default configs."""
-        return dict(
-            diffusion=dict(
-                emb_size=128,
-                time_type="sinusoidal",
-                out_dim1=128,
-                out_dim2=128,
-            ),
-            noise_scheduler=dict(
-                num_timesteps=100,
-                beta_schedule="linear",
-            ),
+        ),
+
+        'LandUse_21': dict(
             Autoencoder=dict(
-                arch1=[59, 1024, 1024, 1024, 128],
-                arch2=[40, 1024, 1024, 1024, 128],
-                activations1='relu',
-                activations2='relu',
-                batchnorm=True,
+                archs=[
+                    [59, 1024, 1024, 1024, 128],
+                    [40, 1024, 1024, 1024, 128],
+                ],
+                activations=['relu', 'relu'],
             ),
             training=dict(
-                missing_rate=0.5,
                 seed=3,
-                mask_seed=5,
-                epoch=200,
-                batch_size=256,
-                lr=1.0e-4,
+                missing_rate=0.5,
+                mmi_weight=0.1,
+                cluster_weight=0.1,
+                hc_weight=0.1,
+                n_clusters=21,
                 alpha=9,
-                lambda1=0.1,
-                lambda2=0.1,
                 temperature_f=0.5,
                 temperature_l=1,
-                n_clusters=21,
             ),
-        )
-    
-    else:
-        raise Exception('Undefined data_name')
+        ),
+    }
+
+    if data_name not in configs:
+        raise ValueError(f"Undefined data_name: {data_name}")
+
+    from copy import deepcopy
+    config = deepcopy(base_config)
+
+    def update_dict(base, new):
+        for k, v in new.items():
+            if isinstance(v, dict) and k in base:
+                update_dict(base[k], v)
+            else:
+                base[k] = v
+
+    update_dict(config, configs[data_name])
+
+    return config

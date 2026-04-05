@@ -4,89 +4,53 @@ import scipy.io as sio
 from scipy import sparse
 
 
-def _resolve_data_file(main_dir, filename, dataset_root=None):
-    """Resolve dataset file path from shared datasets dir first, then local data dir."""
-    candidates = []
-
-    if dataset_root:
-        base = dataset_root if os.path.isabs(dataset_root) else os.path.abspath(os.path.join(main_dir, dataset_root))
-        candidates.append(os.path.join(base, filename))
-
-    candidates.append(os.path.join(main_dir, '..', 'datasets', filename))
-    candidates.append(os.path.join(main_dir, 'data', filename))
-
-    for path in candidates:
-        if os.path.exists(path):
-            return os.path.abspath(path)
-
-    return os.path.abspath(candidates[0])
-
-
-def _resolve_first_existing(main_dir, filenames, dataset_root=None):
-    """Return first existing dataset path from a filename candidate list."""
-    for name in filenames:
-        path = _resolve_data_file(main_dir, name, dataset_root)
-        if os.path.exists(path):
-            return path
-    return _resolve_data_file(main_dir, filenames[0], dataset_root)
-
-
 def load_data(config):
     """Load data """
     data_name = config['dataset']
-    data_key = data_name.lower()
-    main_dir = config.get('main_dir', os.path.dirname(os.path.abspath(__file__)))
-    main_dir = os.path.abspath(main_dir)
-    dataset_root = config.get('dataset_root')
+    main_dir = sys.path[0] 
     
     X_list = []
     Y_list = []
     print("shuffle")
-    if data_key == 'cub':
-        mat = sio.loadmat(_resolve_data_file(main_dir, 'cub_googlenet_doc2vec_c10.mat', dataset_root))
+    if data_name in ['CUB']:
+        # mat = sio.loadmat(os.path.join(main_dir, 'data','cub_googlenet_doc2vec_c10.mat'))
+        mat = sio.loadmat(os.path.join(main_dir, 'data','CUB.mat'))
         X_list.append(mat['X'][0][0].astype('float32'))
         X_list.append(mat['X'][0][1].astype('float32'))
         Y_list.append(np.squeeze(mat['gt']))
 
-    elif data_key == 'landuse_21':
-        mat = sio.loadmat(_resolve_data_file(main_dir, 'LandUse-21.mat', dataset_root))
-        train_x = []
-        train_x.append(sparse.csr_matrix(mat['X'][0, 0]).toarray())  # 20
-        train_x.append(sparse.csr_matrix(mat['X'][0, 1]).toarray())  # 59
-        train_x.append(sparse.csr_matrix(mat['X'][0, 2]).toarray())  # 40
-        index = random.sample(range(train_x[0].shape[0]), 2100)
-        for view in [1, 2]:
-            x = train_x[view][index]
-            X_list.append(x)
-        y = np.squeeze(mat['Y']).astype('int')[index]
-        Y_list.append(y)
+    elif data_name == 'LandUse_21':
+        mat = sio.loadmat(os.path.join(main_dir, 'data', 'LandUse-21.mat'))
+        train_x = [sparse.csr_matrix(mat['X'][0, i]).A.astype('float32') for i in range(3)]
 
-    elif data_key in ['fashion', 'multi-fashion', 'multi_fashion']:
-        fashion_path = _resolve_first_existing(
-            main_dir,
-            ['Fashion.mat', 'multi_fashion.mat', 'Multi-Fashion.mat'],
-            dataset_root,
-        )
-        mat = sio.loadmat(fashion_path)
+        # Subsample 2100 instances
+        idx = np.random.choice(train_x[0].shape[0], 2100, replace=False)
+        X_list = [train_x[i][idx] for i in [1, 2]]  # pick views 1 and 2
+        Y_list.append(np.squeeze(mat['Y'])[idx].astype('int'))
+
+    elif data_name in ['Fashion', 'Multi-Fashion']:
+        mat = sio.loadmat(os.path.join(main_dir, 'data', data_name + '.mat'))
         X_list.append(mat['X1'].reshape(-1,784).astype('float32'))
         X_list.append(mat['X2'].reshape(-1,784).astype('float32'))
         Y_list.append(np.squeeze(mat['Y']))
 
-    elif data_key == 'handwritten':
-        mat = sio.loadmat(_resolve_data_file(main_dir, 'Handwritten.mat', dataset_root))
+    elif data_name in ['HandWritten']:
+        mat = sio.loadmat(os.path.join(main_dir, 'data', data_name + '.mat'))
         X_list.append(mat['X'][1][0].astype('float32'))
         X_list.append(mat['X'][4][0].astype('float32'))
-        y_key = 'Y' if 'Y' in mat else 'y'
-        Y_list.append(np.squeeze(mat[y_key]))
+        Y_list.append(np.squeeze(mat['Y']))
 
-    elif data_key == 'synthetic3d':
-        mat = sio.loadmat(_resolve_data_file(main_dir, 'synthetic3d.mat', dataset_root))
+    elif data_name in ['Synthetic3d']:
+        mat = sio.loadmat(os.path.join(main_dir, 'data', data_name + '.mat'))
         X_list.append(mat['X'][0][0].astype('float32')) #3
         X_list.append(mat['X'][1][0].astype('float32')) #3
         Y_list.append(np.squeeze(mat['Y']))
 
-    else:
-        raise ValueError(f"Unsupported dataset name: {data_name}")
+    elif data_name in ['MNIST_USPS']:
+        mat = sio.loadmat(os.path.join(main_dir, 'data', data_name + '.mat'))
+        X_list.append(mat['X'][0][0].astype('float32')) #3
+        X_list.append(mat['X'][1][0].astype('float32')) #3
+        Y_list.append(np.squeeze(mat['Y']))
 
     return X_list, Y_list
 

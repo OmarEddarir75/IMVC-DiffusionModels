@@ -2,22 +2,14 @@
 
 # Ignore everything by default.
 *
-datasests/
-DMVG/data/
 
 # Keep this file tracked.
 !.gitignore
 !.gitattributes
 
-# Allow DCG and DMVG trees.
+# Allow DCG tree.
 !DCG/
 !DCG/**
-!DCG (NEW)/
-!DCG (NEW)/**
-!DMVG/
-!DMVG/**
-!IMVCDC/
-!IMVCDC/**
 
 # Ignore common generated files even inside allowed trees.
 __pycache__/
@@ -47,11 +39,3 @@ Thumbs.db
 *.temp
 *.md
 **/checkpoints/
-
-# Keep markdown files inside explicitly published trees.
-# !DCG/**/*.md
-# !DCG (NEW)/**/*.md
-# !DMVG/**/*.md
-# !IMVCDC/**/*.md
-
-DMVG/models/

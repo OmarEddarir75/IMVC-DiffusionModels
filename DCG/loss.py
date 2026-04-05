@@ -1,140 +1,149 @@
+# DCG/loss.py
 import math
 import sys
 import torch
-import torch.nn.functional as F
 import torch.nn as nn
+import torch.nn.functional as F
 
 EPS = sys.float_info.epsilon
 
-def _as_probabilities(view, temperature=1.0):
-    """Map arbitrary latent vectors to valid per-sample categorical probabilities."""
-    if temperature <= 0:
-        raise ValueError("temperature must be > 0")
-    return F.softmax(view / temperature, dim=1)
 
-
-def compute_joint(view1, view2, EPS=sys.float_info.epsilon):
-    """Compute a valid, symmetric joint probability matrix P."""
-
+def compute_joint(view1, view2, EPS=1e-10):
+    """Compute a numerically stable joint probability matrix P"""
     bn, k = view1.size()
-    assert (view2.size(0) == bn and view2.size(1) == k)
+    assert view2.size() == (bn, k)
 
-    p_i_j = torch.matmul(view1.t(), view2) / float(bn)
+    # Normalize each row to sum to 1
+    view1 = view1 / view1.sum(dim=1, keepdim=True).clamp(min=EPS)
+    view2 = view2 / view2.sum(dim=1, keepdim=True).clamp(min=EPS)
+
+    # Compute joint: outer product per sample, then mean over batch
+    p_i_j = torch.bmm(view1.unsqueeze(2), view2.unsqueeze(1))  # [batch, k, k]
+    p_i_j = p_i_j.mean(dim=0)                                  # average over batch
+
+    # Symmetrize
     p_i_j = (p_i_j + p_i_j.t()) / 2.0
-    p_i_j = torch.clamp(p_i_j, min=EPS)
-    p_i_j = p_i_j / torch.clamp(p_i_j.sum(), min=EPS)
 
+    # Normalize to sum to 1
+    p_i_j = p_i_j / p_i_j.sum().clamp(min=EPS)
     return p_i_j
 
 
-def MMI(view1, view2, lamb=1.0, temperature=1.0, EPS=sys.float_info.epsilon):
-    """Bounded MMI loss computed from probability views."""
-    _, k = view1.size()
-    view1_prob = _as_probabilities(view1, temperature)
-    view2_prob = _as_probabilities(view2, temperature)
-    p_i_j = compute_joint(view1_prob, view2_prob, EPS)
-    assert (p_i_j.size() == (k, k))
+def MMI(view1, view2, lamb=1.0, EPS=1e-10):
+    """
+    Mutual Information (MMI) loss between two latent views.
+    
+    Args:
+        view1: Tensor of shape [batch, k], latent representations from fused view.
+        view2: Tensor of shape [batch, k], latent representations from a single view.
+        lamb: weighting factor for marginal terms.
+        EPS: small constant to avoid log(0).
+    
+    Returns:
+        Scalar MMI loss.
+    """
+    bn, k = view1.size()
+    assert view2.size() == (bn, k), "view1 and view2 must have the same shape"
 
-    p_i = p_i_j.sum(dim=1, keepdim=True).expand(k, k)
-    p_j = p_i_j.sum(dim=0, keepdim=True).expand(k, k)
+    # Compute joint probability matrix
+    p_i_j = compute_joint(view1, view2, EPS=EPS)
+    assert p_i_j.size() == (k, k)
 
-    p_i_j = torch.clamp(p_i_j, min=EPS)
-    p_j = torch.clamp(p_j, min=EPS)
-    p_i = torch.clamp(p_i, min=EPS)
+    # Compute marginals
+    p_i = p_i_j.sum(dim=1, keepdim=True)  # [k, 1]
+    p_j = p_i_j.sum(dim=0, keepdim=True)  # [1, k]
 
-    mi = p_i_j * (torch.log(p_i_j) - lamb * torch.log(p_j) - lamb * torch.log(p_i))
-    mi = mi.sum()
-    mi = mi / max(math.log(k), EPS)
+    # Clamp for numerical stability
+    p_i_j = p_i_j.clamp(min=EPS)
+    p_i = p_i.clamp(min=EPS)
+    p_j = p_j.clamp(min=EPS)
 
-    return -mi
+    # MMI loss formula
+    loss_matrix = -p_i_j * (torch.log(p_i_j) - lamb * torch.log(p_i) - lamb * torch.log(p_j))
+    loss = loss_matrix.sum()
+    return loss
 
 
 class InstanceLoss(nn.Module):
-    """Instance-level contrast loss"""
-    def __init__(self, batch_size, temperature, device):
-        super(InstanceLoss, self).__init__()
+    """Instance-level contrastive loss"""
+    def __init__(self, batch_size, temperature=0.1, device='cpu'):
+        super().__init__()
         self.batch_size = batch_size
         self.temperature = temperature
         self.device = device
 
-        self.mask = self.mask_correlated_samples(batch_size)
+        self.mask = self._mask_correlated_samples(batch_size).to(device)
         self.criterion = nn.CrossEntropyLoss(reduction="sum")
 
-    def mask_correlated_samples(self, batch_size):
+    def _mask_correlated_samples(self, batch_size):
         N = 2 * batch_size
-        mask = torch.ones((N, N))
-        mask = mask.fill_diagonal_(0)
+        mask = torch.ones((N, N), dtype=torch.bool)
+        mask.fill_diagonal_(0)
         for i in range(batch_size):
             mask[i, batch_size + i] = 0
             mask[batch_size + i, i] = 0
-        mask = mask.bool()
         return mask
 
     def forward(self, z_i, z_j):
         N = 2 * self.batch_size
-        z = torch.cat((z_i, z_j), dim=0)
+        z = torch.cat([z_i, z_j], dim=0)  # [2*B, D]
 
         sim = torch.matmul(z, z.T) / self.temperature
         sim_i_j = torch.diag(sim, self.batch_size)
         sim_j_i = torch.diag(sim, -self.batch_size)
 
-        positive_samples = torch.cat((sim_i_j, sim_j_i), dim=0).reshape(N, 1)
-        negative_samples = sim[self.mask].reshape(N, -1)
+        positive_samples = torch.cat([sim_i_j, sim_j_i], dim=0).view(N, 1)
+        negative_samples = sim[self.mask].view(N, -1)
 
-        labels = torch.zeros(N).to(positive_samples.device).long()
-        logits = torch.cat((positive_samples, negative_samples), dim=1)
+        logits = torch.cat([positive_samples, negative_samples], dim=1)
+        labels = torch.zeros(N, dtype=torch.long, device=z.device)
         loss = self.criterion(logits, labels)
-        loss /= N
-
-        return loss
+        return loss / N
 
 
 class ClusterLoss(nn.Module):
-    """Cluster-level contrast loss"""
-    def __init__(self, class_num, temperature, device):
-        super(ClusterLoss, self).__init__()
+    """Cluster-level contrastive loss"""
+    def __init__(self, class_num, temperature=0.1, device='cpu'):
+        super().__init__()
         self.class_num = class_num
         self.temperature = temperature
         self.device = device
 
-        self.mask = self.mask_correlated_clusters(class_num)
+        self.mask = self._mask_correlated_clusters(class_num).to(device)
         self.criterion = nn.CrossEntropyLoss(reduction="sum")
         self.similarity_f = nn.CosineSimilarity(dim=2)
 
-    def mask_correlated_clusters(self, class_num):
+    def _mask_correlated_clusters(self, class_num):
         N = 2 * class_num
-        mask = torch.ones((N, N))
-        mask = mask.fill_diagonal_(0)
+        mask = torch.ones((N, N), dtype=torch.bool)
+        mask.fill_diagonal_(0)
         for i in range(class_num):
             mask[i, class_num + i] = 0
             mask[class_num + i, i] = 0
-        mask = mask.bool()
         return mask
 
     def forward(self, c_i, c_j, alpha=1.0):
-        p_i = c_i.sum(0).view(-1)
+        # Entropy regularizer
+        p_i = c_i.sum(0)
         p_i /= p_i.sum()
-        ne_i = math.log(p_i.size(0)) + (p_i * torch.log(p_i)).sum()
-        p_j = c_j.sum(0).view(-1)
+        p_j = c_j.sum(0)
         p_j /= p_j.sum()
-        ne_j = math.log(p_j.size(0)) + (p_j * torch.log(p_j)).sum()
-        ne_loss = ne_i + ne_j
+        ne_loss = math.log(p_i.size(0)) + (p_i * torch.log(p_i + EPS)).sum()
+        ne_loss += math.log(p_j.size(0)) + (p_j * torch.log(p_j + EPS)).sum()
 
-        c_i = c_i.t()
-        c_j = c_j.t()
-        N = 2 * self.class_num
-        c = torch.cat((c_i, c_j), dim=0)
-
+        # Contrastive similarity
+        c_i, c_j = c_i.T, c_j.T  # [D, K]
+        c = torch.cat([c_i, c_j], dim=0)  # [2*K, D]
         sim = self.similarity_f(c.unsqueeze(1), c.unsqueeze(0)) / self.temperature
+
         sim_i_j = torch.diag(sim, self.class_num)
         sim_j_i = torch.diag(sim, -self.class_num)
 
-        positive_clusters = torch.cat((sim_i_j, sim_j_i), dim=0).reshape(N, 1)
-        negative_clusters = sim[self.mask].reshape(N, -1)
+        positive_clusters = torch.cat([sim_i_j, sim_j_i], dim=0).view(2 * self.class_num, 1)
+        negative_clusters = sim[self.mask].view(2 * self.class_num, -1)
 
-        labels = torch.zeros(N).to(positive_clusters.device).long()
-        logits = torch.cat((positive_clusters, negative_clusters), dim=1)
-        loss = self.criterion(logits, labels)
-        loss /= N
+        logits = torch.cat([positive_clusters, negative_clusters], dim=1)
+        labels = torch.zeros(2 * self.class_num, dtype=torch.long, device=c.device)
+        loss = self.criterion(logits, labels) / (2 * self.class_num)
 
         return loss + alpha * ne_loss
