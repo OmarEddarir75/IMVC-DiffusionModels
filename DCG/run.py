@@ -212,7 +212,7 @@ def main(MR=[0.1]):
             ]
             mask = torch.from_numpy(mask_np).long().to(device)
 
-            ICDM = ICDM_Model(config, num_views=num_views)
+            ICDM = DCG(config, num_views=num_views)
             ICDM.to_device(device)
 
             # Optimizer: loop through ModuleList for scalability

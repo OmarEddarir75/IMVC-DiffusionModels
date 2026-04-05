@@ -10,7 +10,7 @@ CURRENT_DIR = Path(__file__).resolve().parent
 if str(CURRENT_DIR) not in sys.path:
     sys.path.insert(0, str(CURRENT_DIR))
 
-from ICDM import ICDM_Model
+from ICDM import DCG
 
 
 # Utils
@@ -128,16 +128,17 @@ def build_config():
             "activations": ["relu", "relu", "relu"],
             "batchnorm": True,
         },
+
         "training": {
             "seed": 0,
             "batch_size": 8,
             "epoch": 100,
-            "lr": 1e-3,
+            "lr": 5e-4, 
             "mmi_weight": 0.4,
-            "cluster_weight": 0.3,
+            "cluster_weight": 0.5,
             "rec_weight": 1.0,
-            "diff_weight": 0.05,
-            "ce_weight": 0.2,
+            "diff_weight": 0.1,
+            "ce_weight": 0.05,
             "hc_weight": 0.2,
             "n_clusters": 2,
             "noise_scale": 0.02,
@@ -150,7 +151,7 @@ def build_config():
             "out_dims": [latent_dim] * 3,
         },
         "noise_scheduler": {
-            "num_timesteps": 60,
+            "num_timesteps": 200,
             "beta_schedule": "linear",
         },
         "print_num": 10,
@@ -182,8 +183,11 @@ def run_single(seed):
     config = build_config()
     config["training"]["seed"] = seed
 
-    model = ICDM_Model(config, num_views=3)
-    model.to_device(device)
+    # Pass device directly to model constructor
+    model = DCG(config, num_views=3, device=device)
+    # No need to call model.to_device(device) because it's already on device
+    # But keep to_device for safety (it will be a no-op if already on device)
+    model.to_device(device)   # optional, but harmless
 
     # Pretraining autoencoders before main training loop
     pretrain_autoencoders(model, views, mask, device, epochs=30)

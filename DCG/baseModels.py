@@ -58,81 +58,211 @@ class Unet(nn.Module):
         x = self.joint_mlp(x)
         return x
 
-class NoiseScheduler():
-    def __init__(self,
-                 num_timesteps=1000,
-                 beta_start=0.0001,
-                 beta_end=0.02,
-                 beta_schedule="linear"):
+import torch
+import torch.nn.functional as F
 
+class NoiseScheduler:
+    def __init__(self, num_timesteps=1000, beta_start=0.0001, beta_end=0.02, 
+                 beta_schedule="linear", device="cpu"):
+        """
+        Diffusion noise scheduler.
+        
+        Args:
+            num_timesteps: Number of diffusion steps.
+            beta_start: Starting beta value.
+            beta_end: Ending beta value.
+            beta_schedule: Type of beta schedule ("linear").
+            device: Device to store tensors on.
+        """
+        self.device = device
         self.num_timesteps = num_timesteps
+
+        # Beta schedule
         if beta_schedule == "linear":
-            self.betas = torch.linspace(
-                beta_start, beta_end, num_timesteps, dtype=torch.float32)
-        self.alphas = 1.0 - self.betas
-        self.alphas_cumprod = torch.cumprod(self.alphas, axis=0)
-        self.alphas_cumprod_prev = F.pad(
-            self.alphas_cumprod[:-1], (1, 0), value=1.)
+            betas = torch.linspace(beta_start, beta_end, num_timesteps, dtype=torch.float32)
+        else:
+            raise NotImplementedError(f"Beta schedule {beta_schedule} not implemented")
+        self.betas = betas.to(device)
 
-        self.sqrt_alphas_cumprod = self.alphas_cumprod ** 0.5
-        self.sqrt_one_minus_alphas_cumprod = (1 - self.alphas_cumprod) ** 0.5
+        # Precompute alphas
+        alphas = 1.0 - self.betas
+        self.alphas = alphas.to(device)
+        self.alphas_cumprod = torch.cumprod(self.alphas, dim=0).to(device)
+        self.alphas_cumprod_prev = F.pad(self.alphas_cumprod[:-1], (1, 0), value=1.0).to(device)
 
-        self.sqrt_inv_alphas_cumprod = torch.sqrt(1 / self.alphas_cumprod)
-        self.sqrt_inv_alphas_cumprod_minus_one = torch.sqrt(
-            1 / self.alphas_cumprod - 1)
-        self.posterior_mean_coef1 = self.betas * torch.sqrt(self.alphas_cumprod_prev) / (1. - self.alphas_cumprod)
-        self.posterior_mean_coef2 = (1. - self.alphas_cumprod_prev) * torch.sqrt(self.alphas) / (1. - self.alphas_cumprod)
+        # Precompute commonly used buffers
+        self.sqrt_alphas_cumprod = torch.sqrt(self.alphas_cumprod)
+        self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - self.alphas_cumprod)
+
+        self.sqrt_inv_alphas_cumprod = torch.sqrt(1.0 / self.alphas_cumprod)
+        self.sqrt_inv_alphas_cumprod_minus_one = torch.sqrt(1.0 / self.alphas_cumprod - 1.0)
+
+        self.posterior_mean_coef1 = (self.betas * torch.sqrt(self.alphas_cumprod_prev) / 
+                                     (1.0 - self.alphas_cumprod))
+        self.posterior_mean_coef2 = ((1.0 - self.alphas_cumprod_prev) * torch.sqrt(self.alphas) / 
+                                     (1.0 - self.alphas_cumprod))
+
+        # Move all buffers to device
+        self._move_to_device(device)
+
+    def _move_to_device(self, device):
+        """Move all internal tensors to the specified device."""
+        self.device = device
+        self.betas = self.betas.to(device)
+        self.alphas = self.alphas.to(device)
+        self.alphas_cumprod = self.alphas_cumprod.to(device)
+        self.alphas_cumprod_prev = self.alphas_cumprod_prev.to(device)
+        self.sqrt_alphas_cumprod = self.sqrt_alphas_cumprod.to(device)
+        self.sqrt_one_minus_alphas_cumprod = self.sqrt_one_minus_alphas_cumprod.to(device)
+        self.sqrt_inv_alphas_cumprod = self.sqrt_inv_alphas_cumprod.to(device)
+        self.sqrt_inv_alphas_cumprod_minus_one = self.sqrt_inv_alphas_cumprod_minus_one.to(device)
+        self.posterior_mean_coef1 = self.posterior_mean_coef1.to(device)
+        self.posterior_mean_coef2 = self.posterior_mean_coef2.to(device)
+
+    def to_device(self, device):
+        """Public method to move scheduler to a different device."""
+        self._move_to_device(device)
+        return self
 
     def reconstruct_x0(self, x_t, t, noise):
-        s1 = self.sqrt_inv_alphas_cumprod[t].to(x_t.device)
-        s2 = self.sqrt_inv_alphas_cumprod_minus_one[t].to(x_t.device)
-        s1 = s1.reshape(-1, 1)
-        s2 = s2.reshape(-1, 1)
+        """
+        Reconstruct x0 from x_t and predicted noise.
+        
+        Args:
+            x_t: Noisy sample at time t (batch, dim)
+            t: Timestep (scalar int or tensor)
+            noise: Predicted noise (batch, dim)
+        
+        Returns:
+            Reconstructed x0 (batch, dim)
+        """
+        # Ensure t is a scalar for indexing
+        t_idx = t.item() if torch.is_tensor(t) else t
+        s1 = self.sqrt_inv_alphas_cumprod[t_idx].reshape(-1, 1)
+        s2 = self.sqrt_inv_alphas_cumprod_minus_one[t_idx].reshape(-1, 1)
         return s1 * x_t - s2 * noise
 
     def q_posterior(self, x_0, x_t, t):
-        s1 = self.posterior_mean_coef1[t].to(x_0.device)
-        s2 = self.posterior_mean_coef2[t].to(x_t.device)
-        s1 = s1.reshape(-1, 1)
-        s2 = s2.reshape(-1, 1)
-        mu = s1 * x_0 + s2 * x_t
-        return mu
+        """Compute posterior mean q(x_{t-1} | x_t, x_0)."""
+        t_idx = t.item() if torch.is_tensor(t) else t
+        s1 = self.posterior_mean_coef1[t_idx].reshape(-1, 1)
+        s2 = self.posterior_mean_coef2[t_idx].reshape(-1, 1)
+        return s1 * x_0 + s2 * x_t
 
     def get_variance(self, t):
-        if t == 0:
-            return 0
+        """
+        Get variance for timestep t. Handles both scalar and tensor t.
         
-        # Ensure t is a tensor for indexing if needed, but here it's likely an int or scalar tensor
-        variance = (self.betas[t] * (1. - self.alphas_cumprod_prev[t]) / (1. - self.alphas_cumprod[t]))
+        Args:
+            t: Scalar int, 0D tensor, or 1D tensor of timesteps.
+        
+        Returns:
+            Variance tensor (same shape as t, or scalar if t is scalar).
+        """
         if torch.is_tensor(t):
-            variance = variance.to(t.device)
-        variance = variance.clip(1e-20)
-        return variance
+            # Create output tensor on same device as self.betas
+            variance = torch.zeros_like(t, dtype=torch.float32, device=self.device)
+            non_zero = (t != 0)
+            if non_zero.any():
+                t_nonzero = t[non_zero]
+                # Ensure indices are on CPU for indexing? No, if t is on GPU, need to move? 
+                # Actually, indexing with GPU tensor works if the indexed tensor is also on GPU.
+                # But for safety, we can move to CPU for indexing then back. Better: ensure self.betas etc are on same device.
+                # Since all buffers are on self.device, and t may be on a different device, we need to handle.
+                # We'll assume t is on self.device (caller should ensure). If not, move temporarily.
+                orig_device = t.device
+                if orig_device != self.device:
+                    t_nonzero = t_nonzero.to(self.device)
+                var = (self.betas[t_nonzero] * 
+                       (1.0 - self.alphas_cumprod_prev[t_nonzero]) / 
+                       (1.0 - self.alphas_cumprod[t_nonzero])).clamp(min=1e-20)
+                if orig_device != self.device:
+                    var = var.to(orig_device)
+                variance[non_zero] = var
+            return variance
+        else:
+            # Scalar t
+            if t == 0:
+                return torch.tensor(0.0, device=self.device)
+            variance = self.betas[t] * (1.0 - self.alphas_cumprod_prev[t]) / (1.0 - self.alphas_cumprod[t])
+            return variance.clamp(min=1e-20)
 
-    def step(self, model_output, timestep, sample):
-        t = timestep
+    def _step_single(self, model_output, t, sample):
+        """
+        Single step denoising for a single timestep t (scalar).
+        """
         pred_original_sample = self.reconstruct_x0(sample, t, model_output)
         pred_prev_sample = self.q_posterior(pred_original_sample, sample, t)
-        variance = 0
         if t > 0:
             noise = torch.randn_like(model_output)
-            variance = (self.get_variance(t) ** 0.5) * noise
-        pred_prev_sample = pred_prev_sample + variance
+            variance = torch.sqrt(self.get_variance(t))
+            pred_prev_sample = pred_prev_sample + variance * noise
         return pred_prev_sample
 
-    def add_noise(self, x_start, x_noise, timesteps, device):
-        s1 = self.sqrt_alphas_cumprod[timesteps].to(device)
-        s2 = self.sqrt_one_minus_alphas_cumprod[timesteps].to(device)
-        s1 = s1.view(-1, 1)
-        s2 = s2.view(-1, 1)
-        out1 = s1 * x_start
-        out2 = s2 * x_noise
-        out = out1 + out2
-        return out
+    def step(self, model_output, timestep, sample):
+        """
+        Apply one denoising step. Handles both scalar and batched timesteps.
+        
+        Args:
+            model_output: Predicted noise (batch, dim)
+            timestep: Scalar int, 0D tensor, or 1D tensor of timesteps (batch,)
+            sample: Current noisy sample (batch, dim)
+        
+        Returns:
+            Denoised sample for previous timestep (batch, dim)
+        """
+        if torch.is_tensor(timestep) and timestep.numel() > 1:
+            # Batch of timesteps: check if all same
+            unique_ts = torch.unique(timestep)
+            if len(unique_ts) == 1:
+                # All same, process in batch
+                t_val = unique_ts[0].item()
+                return self._step_single(model_output, t_val, sample)
+            else:
+                # Different timesteps, process each group separately
+                result = torch.zeros_like(sample)
+                for t_val in unique_ts:
+                    mask = (timestep == t_val)
+                    if mask.any():
+                        t_int = t_val.item()
+                        result[mask] = self._step_single(model_output[mask], t_int, sample[mask])
+                return result
+        else:
+            # Scalar timestep
+            t = timestep.item() if torch.is_tensor(timestep) else timestep
+            return self._step_single(model_output, t, sample)
+
+    def add_noise(self, x_start, x_noise, timesteps):
+        """
+        Add noise to x_start according to the diffusion process.
+        
+        Args:
+            x_start: Clean data (batch, dim)
+            x_noise: Random noise (batch, dim)
+            timesteps: Timestep(s) for each sample. Can be scalar int, 0D tensor, or 1D tensor.
+        
+        Returns:
+            Noisy version of x_start (batch, dim)
+        """
+        # Ensure timesteps is on the same device as scheduler tensors
+        if torch.is_tensor(timesteps):
+            if timesteps.device != self.device:
+                timesteps = timesteps.to(self.device)
+            # Ensure timesteps is 1D or scalar
+            if timesteps.dim() == 0:
+                timesteps = timesteps.unsqueeze(0)
+            s1 = self.sqrt_alphas_cumprod[timesteps].view(-1, 1)
+            s2 = self.sqrt_one_minus_alphas_cumprod[timesteps].view(-1, 1)
+        else:
+            # Scalar int
+            s1 = self.sqrt_alphas_cumprod[timesteps].view(-1, 1)
+            s2 = self.sqrt_one_minus_alphas_cumprod[timesteps].view(-1, 1)
+        
+        return s1 * x_start + s2 * x_noise
 
     def __len__(self):
         return self.num_timesteps
-
+    
 class Autoencoder(nn.Module):
     """AutoEncoder module that projects features to latent space."""
 
