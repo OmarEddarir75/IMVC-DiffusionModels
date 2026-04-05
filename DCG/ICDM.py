@@ -1,6 +1,7 @@
 # DCG/ICDM.py
 from pathlib import Path
 from sklearn.utils import shuffle
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 from util import *
 from loss import *
@@ -247,6 +248,11 @@ class DCG(nn.Module):
         if self._device != device:
             self.to_device(device)
 
+        # Schedule for learning rate
+        scheduler = ReduceLROnPlateau(
+            optimizer, mode='min', factor=0.5, patience=10, verbose=True
+        )
+
         criterion_cluster = ClusterLoss(config['training']['n_clusters'], 0.5, device).to(device)
         loss_weights = self._get_loss_weights(config)
 
@@ -260,6 +266,7 @@ class DCG(nn.Module):
         for epoch in range(config['training']['epoch'] + 1):
             loss_all, loss_rec, loss_mmi, loss_df, loss_cluster, loss_hc, loss_ce = 0, 0, 0, 0, 0, 0, 0
             rec_loss_per_view_epoch = [0.0] * self._num_views
+            num_batches = 0
 
             for batch_views, batch_masks in self._iter_batches(views, mask, config['training']['batch_size']):
                 if batch_views[0].shape[0] <= 1:
@@ -285,7 +292,6 @@ class DCG(nn.Module):
 
                         noise = torch.randn_like(latent)
                         timesteps = torch.randint(0, config['noise_scheduler']['num_timesteps'], (latent.shape[0],), device=device).long()
-                        # FIX: removed extra device argument
                         noisy = self.noise_scheduler.add_noise(latent, noise, timesteps)
 
                         noise_pred = self._diffusion_forward(diffusion, noisy, timesteps, view_idx)
@@ -384,7 +390,6 @@ class DCG(nn.Module):
 
                 ce_loss = sum(ce_terms) / len(ce_terms) if ce_terms else self._zero_loss(device)
 
-
                 loss = (
                     loss_weights['rec'] * reconstruction_loss
                     + loss_weights['diff'] * diffusion_loss
@@ -406,6 +411,12 @@ class DCG(nn.Module):
                 loss_cluster += cluster_loss.item()
                 loss_hc += hc_loss.item()
                 loss_ce += ce_loss.item()
+                num_batches += 1
+
+            # Step the scheduler 
+            if num_batches > 0:
+                avg_loss = loss_all / num_batches
+                scheduler.step(avg_loss)
 
             if epoch % config['print_num'] == 0:
                 print(

@@ -14,7 +14,7 @@ from util import set_random_seed
 
 
 # Autoencoder Pretraining
-def pretrain_autoencoders(model, views, mask, device, epochs=30):
+def pretrain_autoencoders(model, views, mask, device, epochs=60):
     optimizer = torch.optim.Adam(model.autoencoders.parameters(), lr=1e-3)
     model.autoencoders.train()
 
@@ -44,8 +44,43 @@ def pretrain_autoencoders(model, views, mask, device, epochs=30):
             print(f"[Pretrain AE] Epoch {epoch} Loss: {total_loss:.4f}")
 
 
+# Diffusion model Pretraining
+def pretrain_diffusions(model, views, mask, device, epochs=50):
+    # Freeze autoencoders
+    for ae in model.autoencoders:
+        for param in ae.parameters():
+            param.requires_grad = False
+
+    optimizer = torch.optim.Adam(model.dfs.parameters(), lr=1e-3)
+
+    for epoch in range(epochs):
+        total_loss = 0.0
+        for v in range(len(views)):
+            # Only train on observed samples
+            m = mask[:, v].bool()
+            if m.sum() == 0:
+                continue
+            with torch.no_grad():
+                latent = model.autoencoders[v].encoder(views[v][m])
+            noise = torch.randn_like(latent)
+            timesteps = torch.randint(0, model.noise_scheduler.num_timesteps, (latent.shape[0],), device=device)
+            noisy = model.noise_scheduler.add_noise(latent, noise, timesteps)
+            noise_pred = model.dfs[v](noisy, timesteps)
+            loss = F.mse_loss(noise_pred, noise)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+        if epoch % 10 == 0:
+            print(f"[Pretrain Diff] Epoch {epoch} Loss: {total_loss:.4f}")
+
+    # Unfreeze autoencoders for joint training
+    for ae in model.autoencoders:
+        for param in ae.parameters():
+            param.requires_grad = True
+
 # Synthetic Data
-def create_synthetic_views(num_samples=24, latent_source_dim=6, nonlinear=True):
+def create_synthetic_views(num_samples=500, latent_source_dim=6, nonlinear=True):
     """
     Create a challenging multi-view synthetic dataset.
     
@@ -119,15 +154,15 @@ def build_config():
 
         "training": {
             "seed": 0,
-            "batch_size": 8,
-            "epoch": 100,
+            "batch_size": 64,
+            "epoch": 150,
             "lr": 5e-4, 
-            "mmi_weight": 0.4,
-            "cluster_weight": 0.5,
             "rec_weight": 1.0,
-            "diff_weight": 0.1,
-            "ce_weight": 0.05,
-            "hc_weight": 0.2,
+            "mmi_weight": 1.0,
+            "cluster_weight": 1.0,
+            "diff_weight": 0.2,
+            "ce_weight": 0.01,
+            "hc_weight": 0.1,
             "n_clusters": 2,
             "noise_scale": 0.02,
             "n_eval": 10,
@@ -149,11 +184,9 @@ def build_config():
 # weight scheduler wrapper
 def apply_weight_schedule(config, epoch):
     warmup = 30
-
     scale = min(1.0, epoch / warmup)
-
-    config["training"]["cluster_weight"] = 0.3 * scale
-    config["training"]["mmi_weight"] = 0.4 * scale
+    config["training"]["cluster_weight"] = 1.0 * scale   # target 1.0
+    config["training"]["mmi_weight"] = 1.0 * scale       # target 1.0
 
 
 # Single Run
@@ -173,12 +206,10 @@ def run_single(seed):
 
     # Pass device directly to model constructor
     model = DCG(config, num_views=3, device=device)
-    # No need to call model.to_device(device) because it's already on device
-    # But keep to_device for safety (it will be a no-op if already on device)
     model.to_device(device)   # optional, but harmless
 
     # Pretraining autoencoders before main training loop
-    pretrain_autoencoders(model, views, mask, device, epochs=30)
+    pretrain_autoencoders(model, views, mask, device, epochs=60)
 
     collapse_stats = {"worst_ratio": 1.0, "epoch": 0}
 
