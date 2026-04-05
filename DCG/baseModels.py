@@ -1,3 +1,4 @@
+# DCG/baseModels.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -57,9 +58,6 @@ class Unet(nn.Module):
         x = torch.cat((x, t_emb), dim=-1)
         x = self.joint_mlp(x)
         return x
-
-import torch
-import torch.nn.functional as F
 
 class NoiseScheduler:
     def __init__(self, num_timesteps=1000, beta_start=0.0001, beta_end=0.02, 
@@ -382,8 +380,6 @@ class AttentionLayer(nn.Module):
             weights = weights * mask.to(weights.dtype)
 
         return (weights.unsqueeze(-1) * h).sum(dim=1)
-
-
 
 class ClusterProject(nn.Module):
     """Projection head for clustering."""

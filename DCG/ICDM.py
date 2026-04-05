@@ -1,12 +1,11 @@
-from sklearn.utils import shuffle
+# DCG/ICDM.py
 from pathlib import Path
+from sklearn.utils import shuffle
 
+from util import *
 from loss import *
-from evaluation import evaluation
-import numpy as np
 from baseModels import *
-from util import target_l2
-
+from evaluation import evaluation
 
 class DCG(nn.Module):    
     def __init__(self, config, num_views=None, device="cpu"):
@@ -47,40 +46,24 @@ class DCG(nn.Module):
         for idx, diffusion in enumerate(self.dfs[:2], start=1):
             setattr(self, f'df{idx}', diffusion)
 
-    def _expand_per_view(self, values, num_views):
-        values = list(values)
-        if not values:
-            return values
-        if len(values) >= num_views:
-            return values[:num_views]
-        return values + [values[-1]] * (num_views - len(values))
-
     def _parse_autoencoder_config(self, autoencoder_config, num_views=None):
         if 'archs' in autoencoder_config:
             archs = autoencoder_config['archs']
             activations = autoencoder_config.get('activations', 'relu')
         else:
-            arch_keys = sorted(
-                [key for key in autoencoder_config if key.startswith('arch')],
-                key=lambda key: int(key[4:])
-            )
-            activation_keys = sorted(
-                [key for key in autoencoder_config if key.startswith('activations')],
-                key=lambda key: int(key[11:])
-            )
-            archs = [autoencoder_config[key] for key in arch_keys]
-            activations = [autoencoder_config[key] for key in activation_keys]
+            archs = get_indexed_config_values(autoencoder_config, 'arch')
+            activations = get_indexed_config_values(autoencoder_config, 'activations')
 
         archs = list(archs)
         if num_views is not None:
-            archs = self._expand_per_view(archs, num_views)
+            archs = expand_per_view(archs, num_views)
 
         if not isinstance(activations, (list, tuple)):
             activations = [activations] * len(archs)
         else:
             activations = list(activations)
             if num_views is not None:
-                activations = self._expand_per_view(activations, len(archs))
+                activations = expand_per_view(activations, len(archs))
 
         return archs, activations
 
@@ -88,14 +71,10 @@ class DCG(nn.Module):
         if 'out_dims' in diffusion_config:
             out_dims = list(diffusion_config['out_dims'])
         else:
-            out_dim_keys = sorted(
-                [key for key in diffusion_config if key.startswith('out_dim')],
-                key=lambda key: int(key[7:])
-            )
-            out_dims = [diffusion_config[key] for key in out_dim_keys]
+            out_dims = get_indexed_config_values(diffusion_config, 'out_dim')
 
         if num_views is not None:
-            out_dims = self._expand_per_view(out_dims, num_views)
+            out_dims = expand_per_view(out_dims, num_views)
         return out_dims
 
     def _parse_train_args(self, args):

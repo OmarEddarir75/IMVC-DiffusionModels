@@ -1,5 +1,4 @@
 import sys
-import random
 import itertools
 from pathlib import Path
 
@@ -11,18 +10,7 @@ if str(CURRENT_DIR) not in sys.path:
     sys.path.insert(0, str(CURRENT_DIR))
 
 from ICDM import DCG
-
-
-# Utils
-def set_seed(seed=0):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
+from util import set_random_seed
 
 
 # Autoencoder Pretraining
@@ -170,7 +158,7 @@ def apply_weight_schedule(config, epoch):
 
 # Single Run
 def run_single(seed):
-    set_seed(seed)
+    set_random_seed(seed)
 
     views_np, labels = create_synthetic_views()
     mask_np = create_mask(len(labels), 3)

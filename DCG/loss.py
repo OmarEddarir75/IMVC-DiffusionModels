@@ -1,6 +1,6 @@
 # DCG/loss.py
-import math
 import sys
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -8,7 +8,7 @@ import torch.nn.functional as F
 EPS = sys.float_info.epsilon
 
 
-def compute_joint(view1, view2, EPS=1e-10):
+def compute_joint(view1, view2, EPS=EPS):
     """Compute a numerically stable joint probability matrix P"""
     bn, k = view1.size()
     assert view2.size() == (bn, k)
@@ -29,7 +29,7 @@ def compute_joint(view1, view2, EPS=1e-10):
     return p_i_j
 
 
-def MMI(view1, view2, lamb=1.0, EPS=1e-10):
+def MMI(view1, view2, lamb=1.0, EPS=EPS):
     """
     Mutual Information (MMI) loss between two latent views.
     
