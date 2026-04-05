@@ -250,7 +250,7 @@ class DCG(nn.Module):
 
         # Schedule for learning rate
         scheduler = ReduceLROnPlateau(
-            optimizer, mode='min', factor=0.5, patience=10, verbose=True
+            optimizer, mode='min', factor=0.5, patience=10,
         )
 
         criterion_cluster = ClusterLoss(config['training']['n_clusters'], 0.5, device).to(device)
