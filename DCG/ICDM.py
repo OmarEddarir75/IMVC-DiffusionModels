@@ -14,6 +14,8 @@ class DCG(nn.Module):
         self._config = config
         self._device = device
 
+        self.stop_training = False
+        self.debug_assignments = []
         self._degenerate_std_threshold = config['training'].get('degenerate_std_threshold', 1e-6)
 
         archs, activations = self._parse_autoencoder_config(config['Autoencoder'], num_views)
@@ -58,17 +60,18 @@ class DCG(nn.Module):
             device=device
         )
 
-        # Cluster + attention
+        # Cluster + attention – with configurable initialisation
+        init_mode = config['training'].get('cluster_init', 'kmeans_plus_plus')
         self.clusterLayer = ClusterProject(
             self._latent_dim,
-            config['training']['n_clusters']
+            config['training']['n_clusters'],
+            init_mode=init_mode          # <-- new argument
         )
 
         self.AttentionLayer = AttentionLayer(self._latent_dim)
 
         self.to_device(device)
-      
-        
+
     def _parse_autoencoder_config(self, autoencoder_config, num_views=None):
         if 'archs' in autoencoder_config:
             archs = autoencoder_config['archs']
@@ -273,17 +276,16 @@ class DCG(nn.Module):
     def _zero_loss(self, device):
         return torch.zeros(1, device=device).squeeze()
 
-    def train(self, config=None, *args, eval_callback=None, epoch_callback=None):
-        if config is None:
-            return super().train(True)
-        if isinstance(config, bool) and not args:
-            return super().train(config)
+    def train(self, config, *args, eval_callback=None, epoch_callback=None):
         # Parse training inputs
         views, Y_list, mask, optimizer, device = self._parse_train_args(args)
 
         # Ensure model is on correct device
         if self._device != device:
             self.to_device(device)
+
+        # Reset early stop flag (in case model is reused)
+        self.stop_training = False
 
         # Schedule for learning rate
         scheduler = ReduceLROnPlateau(
@@ -299,8 +301,14 @@ class DCG(nn.Module):
         noise_scale = float(training_cfg.get('noise_scale', 0.1))
 
         for epoch in range(config['training']['epoch'] + 1):
+            # EARLY STOPPING CHECK at start of epoch
+            if self.stop_training:
+                print(f"Early stopping requested – exiting at epoch {epoch}")
+                break
+
             if epoch_callback is not None:
                 epoch_callback(epoch, self)
+
             loss_weights = self._get_loss_weights(config)
             loss_all, loss_rec, loss_mmi, loss_df, loss_cluster, loss_hc, loss_ce = 0, 0, 0, 0, 0, 0, 0
             rec_loss_per_view_epoch = [0.0] * self._num_views
@@ -362,8 +370,6 @@ class DCG(nn.Module):
                 if len(per_view_losses_tensor) > 0:
                     per_view_losses_tensor = torch.stack(per_view_losses_tensor)
                     reconstruction_loss = per_view_losses_tensor.mean()
-                    # balance_loss = torch.var(per_view_losses_tensor)
-                    # reconstruction_loss = reconstruction_loss + 0.1 * balance_loss
                 else:
                     reconstruction_loss = self._zero_loss(device)
 
@@ -377,7 +383,7 @@ class DCG(nn.Module):
                     fused_observed = fused_latent[observed]
                     if self._is_degenerate_view(latent) or self._is_degenerate_view(fused_observed):
                         continue
-                    mmi_terms.append(MMI(fused_observed, F.softmax(latent, dim=1)))
+                    mmi_terms.append(MMI(F.softmax(fused_observed, dim=1), F.softmax(latent, dim=1)))
                 mmi_loss = sum(mmi_terms) / len(mmi_terms) if mmi_terms else self._zero_loss(device)
 
                 # Cluster & HC loss
@@ -407,35 +413,33 @@ class DCG(nn.Module):
 
                 # Cross-view consistency loss
                 ce_terms = []
-                # ce_criterion_cache = {}
-                # stacked_latents = torch.stack(latent_bank, dim=0)
-                # available_float = view_mask_tensor.to(stacked_latents.dtype)
-                # masked_latents = stacked_latents * available_float.T.unsqueeze(-1)
-                # latent_sum = masked_latents.sum(dim=0)
+                ce_criterion_cache = {}
+                stacked_latents = torch.stack(latent_bank, dim=0)
+                available_float = view_mask_tensor.to(stacked_latents.dtype)
+                masked_latents = stacked_latents * available_float.T.unsqueeze(-1)
+                latent_sum = masked_latents.sum(dim=0)
 
-                # for view_idx, diffusion in enumerate(self.dfs):
-                #     target_observed = view_mask_tensor[:, view_idx]
-                #     source_count = available_counts - target_observed.long()
-                #     valid = target_observed & (source_count > 0)
-                #     valid_count = int(valid.sum().item())
-                #     if valid_count <= 1:
-                #         continue
-                #     valid_indices = valid.nonzero(as_tuple=True)[0]
-                #     source_sum = latent_sum - masked_latents[view_idx]
-                #     source_latent = source_sum.index_select(0, valid_indices) / source_count.index_select(0, valid_indices).unsqueeze(1).to(source_sum.dtype)
-                #     recovered_latent = self._recover_latent(source_latent, diffusion, view_idx, device, fast=True)
-                #     criterion_instance_local = ce_criterion_cache.get(valid_count)
-                #     if criterion_instance_local is None:
-                #         criterion_instance_local = InstanceLoss(valid_count, 1.0, device).to(device)
-                #         ce_criterion_cache[valid_count] = criterion_instance_local
-                #     ce_terms.append(
-                #         criterion_instance_local(
-                #             recovered_latent, 
-                #             fused_latent.index_select(0, valid_indices).detach()
-                #         )
-
-                #     )
-
+                for view_idx, diffusion in enumerate(self.dfs):
+                    target_observed = view_mask_tensor[:, view_idx]
+                    source_count = available_counts - target_observed.long()
+                    valid = target_observed & (source_count > 0)
+                    valid_count = int(valid.sum().item())
+                    if valid_count <= 1:
+                        continue
+                    valid_indices = valid.nonzero(as_tuple=True)[0]
+                    source_sum = latent_sum - masked_latents[view_idx]
+                    source_latent = source_sum.index_select(0, valid_indices) / source_count.index_select(0, valid_indices).unsqueeze(1).to(source_sum.dtype)
+                    recovered_latent = self._recover_latent(source_latent, diffusion, view_idx, device, fast=True)
+                    criterion_instance_local = ce_criterion_cache.get(valid_count)
+                    if criterion_instance_local is None:
+                        criterion_instance_local = InstanceLoss(valid_count, 1.0, device).to(device)
+                        ce_criterion_cache[valid_count] = criterion_instance_local
+                    ce_terms.append(
+                        criterion_instance_local(
+                            recovered_latent, 
+                            fused_latent.index_select(0, valid_indices).detach()
+                        )
+                    )
 
                 ce_loss = sum(ce_terms) / len(ce_terms) if ce_terms else self._zero_loss(device)
 
@@ -479,14 +483,33 @@ class DCG(nn.Module):
 
             self.debug_rec_loss_per_view_epoch = rec_loss_per_view_epoch
 
+            # ---------- EVALUATION ----------
             if epoch % n_eval == 0:
                 scores = self.evaluation(config, mask, views, Y_list, device)
+
+                # Call user callback (may set self.stop_training)
                 if eval_callback is not None:
                     eval_callback(epoch, scores, self)
+
                 if save_eval_checkpoint:
                     self._save_eval_checkpoint(config, epoch, scores, optimizer=optimizer)
+
+                # --- ALWAYS store assignments (for debugging) ---
+                with torch.no_grad():
+                    latent_codes = self._compute_latent_codes(mask, views, device)
+                    latent_fusion = self.AttentionLayer(latent_codes, mask=mask == 1)
+                    y, _ = self.clusterLayer(latent_fusion)
+                    assignments_np = y.argmax(dim=1).cpu().numpy()
+                    self.debug_assignments.append((epoch, assignments_np.copy()))
+
+                # Update best metrics
                 if scores['accuracy'] >= best_acc:
                     best_acc, best_nmi, best_ari = scores['accuracy'], scores['NMI'], scores['ARI']
+
+                # --- Early stop check after callback ---
+                if self.stop_training:
+                    print(f"Early stopping triggered at epoch {epoch}")
+                    break
 
         return best_acc, best_nmi, best_ari
 
