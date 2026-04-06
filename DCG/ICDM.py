@@ -1,3 +1,4 @@
+# TODO:
 # DCG/ICDM.py
 from pathlib import Path
 from sklearn.utils import shuffle
@@ -162,22 +163,10 @@ class DCG(nn.Module):
         return torch.all(latent.std(dim=0) < self._degenerate_std_threshold).item()
 
     def _iter_batches(self, views, mask, batch_size):
-        use_torch = all(torch.is_tensor(v) for v in views) and torch.is_tensor(mask)
+        shuffled = shuffle(*views, *[mask[:, idx] for idx in range(self._num_views)])
+        shuffled_views = list(shuffled[:self._num_views])
+        shuffled_masks = list(shuffled[self._num_views:])
         total = views[0].shape[0]
-
-        if use_torch:
-            base_device = views[0].device
-            same_device = (mask.device == base_device) and all(v.device == base_device for v in views)
-            if same_device:
-                perm = torch.randperm(total, device=base_device)
-                shuffled_views = [v.index_select(0, perm) for v in views]
-                shuffled_masks = [mask[:, idx].index_select(0, perm) for idx in range(self._num_views)]
-            else:
-                use_torch = False
-        else:
-            shuffled = shuffle(*views, *[mask[:, idx] for idx in range(self._num_views)])
-            shuffled_views = list(shuffled[:self._num_views])
-            shuffled_masks = list(shuffled[self._num_views:])
 
         for start in range(0, total, batch_size):
             end = min(start + batch_size, total)
@@ -268,7 +257,7 @@ class DCG(nn.Module):
         }
         if optimizer is not None:
             payload['optimizer_state_dict'] = optimizer.state_dict()
-        torch.save(payload, checkpoint_path)
+            torch.save(payload, checkpoint_path)
 
     def _zero_loss(self, device):
         return torch.zeros(1, device=device).squeeze()
@@ -287,6 +276,8 @@ class DCG(nn.Module):
         )
 
         criterion_cluster = ClusterLoss(config['training']['n_clusters'], 0.5, device).to(device)
+        criterion_instance = InstanceLoss(config['training']['batch_size'], 1.0, device).to(device)
+
         best_acc, best_nmi, best_ari = 0, 0, 0
 
         training_cfg = config['training']
@@ -358,8 +349,8 @@ class DCG(nn.Module):
                 if len(per_view_losses_tensor) > 0:
                     per_view_losses_tensor = torch.stack(per_view_losses_tensor)
                     reconstruction_loss = per_view_losses_tensor.mean()
-                    # balance_loss = torch.var(per_view_losses_tensor)
-                    # reconstruction_loss = reconstruction_loss + 0.1 * balance_loss
+                    balance_loss = torch.var(per_view_losses_tensor)
+                    reconstruction_loss = reconstruction_loss + 0.1 * balance_loss
                 else:
                     reconstruction_loss = self._zero_loss(device)
 
@@ -403,7 +394,6 @@ class DCG(nn.Module):
 
                 # Cross-view consistency loss
                 ce_terms = []
-                ce_criterion_cache = {}
                 stacked_latents = torch.stack(latent_bank, dim=0)
                 available_float = view_mask_tensor.to(stacked_latents.dtype)
                 masked_latents = stacked_latents * available_float.T.unsqueeze(-1)
@@ -420,10 +410,7 @@ class DCG(nn.Module):
                     source_sum = latent_sum - masked_latents[view_idx]
                     source_latent = source_sum.index_select(0, valid_indices) / source_count.index_select(0, valid_indices).unsqueeze(1).to(source_sum.dtype)
                     recovered_latent = self._recover_latent(source_latent, diffusion, view_idx, device, fast=True)
-                    criterion_instance_local = ce_criterion_cache.get(valid_count)
-                    if criterion_instance_local is None:
-                        criterion_instance_local = InstanceLoss(valid_count, 1.0, device).to(device)
-                        ce_criterion_cache[valid_count] = criterion_instance_local
+                    criterion_instance_local = InstanceLoss(valid_count, 1.0, device).to(device)
                     ce_terms.append(
                         criterion_instance_local(
                             recovered_latent, 
@@ -462,9 +449,8 @@ class DCG(nn.Module):
 
             # Step the scheduler 
             if num_batches > 0:
-                # avg_loss = loss_all / num_batches
-                # scheduler.step(avg_loss)
-                scheduler.step(reconstruction_loss)
+                avg_loss = loss_all / num_batches
+                scheduler.step(avg_loss)
 
             if epoch % config['print_num'] == 0:
                 print(
