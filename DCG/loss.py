@@ -29,7 +29,7 @@ def compute_joint(view1, view2, EPS=EPS):
     return p_i_j
 
 
-def MMI(view1, view2, lamb=1.0, EPS=EPS):
+def MMI(view1, view2, lamb=10.0, EPS=EPS):
     """
     Mutual Information (MMI) loss between two latent views.
     
