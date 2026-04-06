@@ -170,7 +170,7 @@ def get_default_config(data_name):
             ),
         ),
 
-        'LandUse_21': dict(
+        'LandUse-21': dict(
             Autoencoder=dict(
                 archs=[
                     [59, 1024, 1024, 1024, 128],
