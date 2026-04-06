@@ -264,11 +264,7 @@ class NoiseScheduler:
 class Autoencoder(nn.Module):
     """AutoEncoder module that projects features to latent space."""
 
-    def __init__(self,
-                 encoder_dim,
-                 activation='relu',
-                 batchnorm=True):
-
+    def __init__(self, encoder_dim, activation='relu', batchnorm=True):
         super(Autoencoder, self).__init__()
 
         self._dim = len(encoder_dim) - 1
@@ -297,7 +293,7 @@ class Autoencoder(nn.Module):
                 nn.Linear(encoder_dim[i], encoder_dim[i + 1]))
             if i < self._dim - 1:
                 if self._batchnorm:
-                    encoder_layers.append(nn.BatchNorm1d(encoder_dim[i + 1]))
+                    encoder_layers.append(nn.LayerNorm(encoder_dim[i + 1]))
                 encoder_layers.append(get_activation())
 
         encoder_layers.append(nn.Softmax(dim=1))
@@ -310,10 +306,10 @@ class Autoencoder(nn.Module):
                 nn.Linear(decoder_dim[i], decoder_dim[i + 1]))
             if i < self._dim - 1: # Usually we don't apply BN/Act on the final output layer of decoder unless specified
                 if self._batchnorm:
-                    decoder_layers.append(nn.BatchNorm1d(decoder_dim[i + 1]))
+                    decoder_layers.append(nn.LayerNorm(decoder_dim[i + 1]))
                 decoder_layers.append(get_activation())
 
-        decoder_layers.append(nn.Softmax(dim=1))
+        # decoder_layers.append(nn.Softmax(dim=1))
         self._decoder = nn.Sequential(*decoder_layers)
 
     def encoder(self, x):
@@ -335,10 +331,10 @@ class AttentionLayer(nn.Module):
         self._latent_dim = latent_dim
         self.mlp = nn.Sequential(
             nn.Linear(self._latent_dim, self._latent_dim),
-            nn.BatchNorm1d(self._latent_dim),
+            nn.LayerNorm(self._latent_dim),
             nn.ReLU(),
             nn.Linear(self._latent_dim, self._latent_dim),
-            nn.BatchNorm1d(self._latent_dim),
+            nn.LayerNorm(self._latent_dim),
             nn.ReLU(),
         )
         self.output_layer = nn.Linear(self._latent_dim, 1, bias=True)
@@ -389,7 +385,7 @@ class ClusterProject(nn.Module):
         self._n_clusters = n_clusters
         self.cluster_projector = nn.Sequential(
             nn.Linear(self._latent_dim, self._latent_dim),
-            nn.BatchNorm1d(self._latent_dim),
+            nn.LayerNorm(self._latent_dim),
             nn.ReLU(),
         )
         self.cluster = nn.Sequential(

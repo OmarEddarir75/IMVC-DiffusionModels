@@ -14,10 +14,11 @@ class DCG(nn.Module):
         self._config = config
         self._device = device
 
+        self._degenerate_std_threshold = config['training'].get('degenerate_std_threshold', 1e-6)
         archs, activations = self._parse_autoencoder_config(config['Autoencoder'], num_views)
         out_dims = self._parse_diffusion_config(config['diffusion'], len(archs))
         self._num_views = len(archs)
-
+        
         if len(activations) != self._num_views or len(out_dims) != self._num_views:
             raise ValueError('Inconsistent number of views in config!')
 
@@ -122,23 +123,24 @@ class DCG(nn.Module):
         )
         return df(conditioned_latent, timestep)
 
-    def _recover_latent(self, latent, df, view_idx, device):
+    def _recover_latent(self, latent, df, view_idx, device, fast=False):
         if latent.size(0) == 0:
             return latent
-
         recovered = latent
-        for t in range(len(self.noise_scheduler) - 1, -1, -1):
+        num_steps = len(self.noise_scheduler)
+        max_steps = 50 if fast else num_steps
+        start_step = num_steps - 1
+        for t in range(start_step, start_step - max_steps, -1):
             timestep = torch.full((recovered.shape[0],), t, dtype=torch.long, device=device)
             with torch.no_grad():
                 denoised = self._diffusion_forward(df, recovered, timestep, view_idx)
-            # Pass full timestep tensor (batched)
             recovered = self.noise_scheduler.step(denoised, timestep, recovered)
         return recovered
 
     def _is_degenerate_view(self, latent):
         if latent.size(0) <= 1:
             return True
-        return torch.all(latent.std(dim=0) < 1e-6).item()
+        return torch.all(latent.std(dim=0) < self._degenerate_std_threshold).item()
 
     def _iter_batches(self, views, mask, batch_size):
         shuffled = shuffle(*views, *[mask[:, idx] for idx in range(self._num_views)])
@@ -240,7 +242,7 @@ class DCG(nn.Module):
     def _zero_loss(self, device):
         return torch.zeros(1, device=device).squeeze()
 
-    def train(self, config, *args, eval_callback=None):
+    def train(self, config, *args, eval_callback=None, epoch_callback=None):
         # Parse training inputs
         views, Y_list, mask, optimizer, device = self._parse_train_args(args)
 
@@ -254,7 +256,6 @@ class DCG(nn.Module):
         )
 
         criterion_cluster = ClusterLoss(config['training']['n_clusters'], 0.5, device).to(device)
-        loss_weights = self._get_loss_weights(config)
 
         best_acc, best_nmi, best_ari = 0, 0, 0
 
@@ -264,6 +265,9 @@ class DCG(nn.Module):
         noise_scale = float(training_cfg.get('noise_scale', 0.1))
 
         for epoch in range(config['training']['epoch'] + 1):
+            if epoch_callback is not None:
+                epoch_callback(epoch, self)
+            loss_weights = self._get_loss_weights(config)
             loss_all, loss_rec, loss_mmi, loss_df, loss_cluster, loss_hc, loss_ce = 0, 0, 0, 0, 0, 0, 0
             rec_loss_per_view_epoch = [0.0] * self._num_views
             num_batches = 0
@@ -295,9 +299,9 @@ class DCG(nn.Module):
                         noisy = self.noise_scheduler.add_noise(latent, noise, timesteps)
 
                         noise_pred = self._diffusion_forward(diffusion, noisy, timesteps, view_idx)
-                        noise_diff = noise_pred - noise
-                        diffusion_loss += (noise_diff ** 2).mean(dim=1).mean()
+                        diffusion_loss += F.mse_loss(noise_pred, noise)
 
+                    diffusion_loss = diffusion_loss / self._num_views
                     latent_bank.append(latent_full)
 
                 available_counts = view_mask_tensor.sum(dim=1)
@@ -384,7 +388,7 @@ class DCG(nn.Module):
                     valid_indices = valid.nonzero(as_tuple=True)[0]
                     source_sum = latent_sum - masked_latents[view_idx]
                     source_latent = source_sum.index_select(0, valid_indices) / source_count.index_select(0, valid_indices).unsqueeze(1).to(source_sum.dtype)
-                    recovered_latent = self._recover_latent(source_latent, diffusion, view_idx, device)
+                    recovered_latent = self._recover_latent(source_latent, diffusion, view_idx, device, fast=True)
                     criterion_instance = InstanceLoss(valid_count, 1.0, device).to(device)
                     ce_terms.append(criterion_instance(recovered_latent, fused_latent.index_select(0, valid_indices).detach()))
 
@@ -401,7 +405,8 @@ class DCG(nn.Module):
 
                 optimizer.zero_grad()
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.parameters(), 5.0)
+                max_grad_norm = config['training'].get('grad_clip_norm', 5.0)
+                torch.nn.utils.clip_grad_norm_(self.parameters(), max_grad_norm)
                 optimizer.step()
 
                 loss_all += loss.item()
