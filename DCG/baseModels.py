@@ -384,7 +384,6 @@ class ClusterProject(nn.Module):
         self.init_mode = init_mode
         self._latent_dim = latent_dim
         self._n_clusters = n_clusters
-        # Direct linear layer + softmax (shared classifier)
         self.cluster = nn.Linear(latent_dim, n_clusters)
         self.softmax = nn.Softmax(dim=1)
 
