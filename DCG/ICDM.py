@@ -301,8 +301,8 @@ class DCG(nn.Module):
                         noise_pred = self._diffusion_forward(diffusion, noisy, timesteps, view_idx)
                         diffusion_loss += F.mse_loss(noise_pred, noise)
 
-                    diffusion_loss = diffusion_loss / self._num_views
                     latent_bank.append(latent_full)
+                diffusion_loss = diffusion_loss / self._num_views
 
                 available_counts = view_mask_tensor.sum(dim=1)
                 usable_mask = available_counts > 0
