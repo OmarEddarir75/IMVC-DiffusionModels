@@ -462,8 +462,9 @@ class DCG(nn.Module):
 
             # Step the scheduler 
             if num_batches > 0:
-                avg_loss = loss_all / num_batches
-                scheduler.step(avg_loss)
+                # avg_loss = loss_all / num_batches
+                # scheduler.step(avg_loss)
+                scheduler.step(reconstruction_loss)
 
             if epoch % config['print_num'] == 0:
                 print(
