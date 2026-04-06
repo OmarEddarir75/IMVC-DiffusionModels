@@ -8,79 +8,16 @@ import torch.nn.functional as F
 EPS = sys.float_info.epsilon
 
 
-def compute_joint(view1, view2, EPS=EPS):
-    """
-    Compute a numerically stable joint probability matrix P.
-
-    Args:
-        view1: Tensor of shape [batch_size, k], row-stochastic (sum=1 per row).
-        view2: Tensor of shape [batch_size, k], row-stochastic.
-        EPS: Small constant for numerical stability.
-
-    Returns:
-        p_ij: Symmetric joint probability matrix of shape [k, k] summing to 1.
-    """
-    bn, k = view1.size()
-    assert view2.size() == (bn, k)
-
-    # Normalize each row to sum to 1 (ensures stochasticity)
-    view1 = view1 / view1.sum(dim=1, keepdim=True).clamp(min=EPS)
-    view2 = view2 / view2.sum(dim=1, keepdim=True).clamp(min=EPS)
-
-    # Joint: outer product per sample, then average over batch
-    p_i_j = torch.bmm(view1.unsqueeze(2), view2.unsqueeze(1))  # [batch, k, k]
-    p_i_j = p_i_j.mean(dim=0)                                  # average over batch
-
-    # Symmetrize
-    p_i_j = (p_i_j + p_i_j.t()) / 2.0
-
-    # Normalize to sum to 1
-    p_i_j = p_i_j / p_i_j.sum().clamp(min=EPS)
-    return p_i_j
-
-
-def MMI(view1, view2, lamb=1.0, EPS=EPS):
-    """
-    Mutual information (MI) based loss between two latent views.
-    With lamb=1.0, this equals -I(view1; view2) (negative mutual information).
-    Minimizing this loss maximizes the dependence between views.
-
-    Args:
-        view1: Tensor of shape [batch, k], latent codes (e.g., fused view).
-        view2: Tensor of shape [batch, k], latent codes (e.g., single view).
-        lamb: Weight for marginal entropy terms. lamb=1 gives standard -MI,
-              lamb=0 removes marginal terms (only cross-entropy part).
-        EPS: Small constant for numerical stability.
-
-    Returns:
-        Scalar loss value (negative mutual information or a variant).
-    """
-    bn, k = view1.size()
-    assert view2.size() == (bn, k), "view1 and view2 must have the same shape"
-
-    # Compute joint probability matrix
-    p_i_j = compute_joint(view1, view2, EPS=EPS)
-    p_i_j = 0.5 * p_i_j + 0.5 * p_i_j.detach()
-    assert p_i_j.size() == (k, k)
-
-    # Compute marginals
-    p_i = p_i_j.sum(dim=1, keepdim=True)  # [k, 1]
-    p_j = p_i_j.sum(dim=0, keepdim=True)  # [1, k]
-
-    # Clamp for numerical stability
-    p_i_j = p_i_j.clamp(min=EPS)
-    p_i = p_i.clamp(min=EPS)
-    p_j = p_j.clamp(min=EPS)
-
-    # MMI loss formula: -p_ij * (log p_ij - lamb*log p_i - lamb*log p_j)
-    loss_matrix = -p_i_j * (torch.log(p_i_j) - lamb * torch.log(p_i) - lamb * torch.log(p_j))
-    loss = loss_matrix.sum()
-    return loss
-
+def MMI(view1, view2):
+    """Maximise cosine similarity between fused and single-view latents."""
+    v1 = F.normalize(view1, dim=1)
+    v2 = F.normalize(view2, dim=1)
+    cos_sim = (v1 * v2).sum(dim=1)
+    return -cos_sim.mean()
 
 class InstanceLoss(nn.Module):
     """Instance-level contrastive loss (NT-Xent) for cross-view consistency."""
-    def __init__(self, batch_size, temperature=0.1, device='cpu'):
+    def __init__(self, batch_size, temperature=0.5, device='cpu'):
         super().__init__()
         self.batch_size = batch_size
         self.temperature = temperature
@@ -182,3 +119,76 @@ class ClusterLoss(nn.Module):
         loss = self.criterion(logits, labels) / logits.size(0)
 
         return loss + alpha * ne_loss / self.class_num
+
+
+
+# def compute_joint(view1, view2, EPS=EPS):
+#     """
+#     Compute a numerically stable joint probability matrix P.
+
+#     Args:
+#         view1: Tensor of shape [batch_size, k], row-stochastic (sum=1 per row).
+#         view2: Tensor of shape [batch_size, k], row-stochastic.
+#         EPS: Small constant for numerical stability.
+
+#     Returns:
+#         p_ij: Symmetric joint probability matrix of shape [k, k] summing to 1.
+#     """
+#     bn, k = view1.size()
+#     assert view2.size() == (bn, k)
+
+#     # Normalize each row to sum to 1 (ensures stochasticity)
+#     view1 = view1 / view1.sum(dim=1, keepdim=True).clamp(min=EPS)
+#     view2 = view2 / view2.sum(dim=1, keepdim=True).clamp(min=EPS)
+
+#     # Joint: outer product per sample, then average over batch
+#     p_i_j = torch.bmm(view1.unsqueeze(2), view2.unsqueeze(1))  # [batch, k, k]
+#     p_i_j = p_i_j.mean(dim=0)                                  # average over batch
+
+#     # Symmetrize
+#     p_i_j = (p_i_j + p_i_j.t()) / 2.0
+
+#     # Normalize to sum to 1
+#     p_i_j = p_i_j / p_i_j.sum().clamp(min=EPS)
+#     return p_i_j
+
+
+# def MMI(view1, view2, lamb=1.0, EPS=EPS):
+#     """
+#     Mutual information (MI) based loss between two latent views.
+#     With lamb=1.0, this equals -I(view1; view2) (negative mutual information).
+#     Minimizing this loss maximizes the dependence between views.
+
+#     Args:
+#         view1: Tensor of shape [batch, k], latent codes (e.g., fused view).
+#         view2: Tensor of shape [batch, k], latent codes (e.g., single view).
+#         lamb: Weight for marginal entropy terms. lamb=1 gives standard -MI,
+#               lamb=0 removes marginal terms (only cross-entropy part).
+#         EPS: Small constant for numerical stability.
+
+#     Returns:
+#         Scalar loss value (negative mutual information or a variant).
+#     """
+#     bn, k = view1.size()
+#     assert view2.size() == (bn, k), "view1 and view2 must have the same shape"
+
+#     # Compute joint probability matrix
+#     p_i_j = compute_joint(view1, view2, EPS=EPS)
+#     p_i_j = 0.5 * p_i_j + 0.5 * p_i_j.detach()
+#     assert p_i_j.size() == (k, k)
+
+#     # Compute marginals
+#     p_i = p_i_j.sum(dim=1, keepdim=True)  # [k, 1]
+#     p_j = p_i_j.sum(dim=0, keepdim=True)  # [1, k]
+
+#     # Clamp for numerical stability
+#     p_i_j = p_i_j.clamp(min=EPS)
+#     p_i = p_i.clamp(min=EPS)
+#     p_j = p_j.clamp(min=EPS)
+
+#     # MMI loss formula: -p_ij * (log p_ij - lamb*log p_i - lamb*log p_j)
+#     loss_matrix = -p_i_j * (torch.log(p_i_j) - lamb * torch.log(p_i) - lamb * torch.log(p_j))
+#     loss = loss_matrix.sum()
+#     return loss
+
+
