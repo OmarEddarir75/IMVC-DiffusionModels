@@ -15,10 +15,11 @@ class DCG(nn.Module):
         self._device = device
 
         self._degenerate_std_threshold = config['training'].get('degenerate_std_threshold', 1e-6)
+
         archs, activations = self._parse_autoencoder_config(config['Autoencoder'], num_views)
         out_dims = self._parse_diffusion_config(config['diffusion'], len(archs))
         self._num_views = len(archs)
-        
+
         if len(activations) != self._num_views or len(out_dims) != self._num_views:
             raise ValueError('Inconsistent number of views in config!')
 
@@ -27,27 +28,47 @@ class DCG(nn.Module):
             raise ValueError('Inconsistent latent dim!')
 
         self._latent_dim = latent_dims[0]
+
+        self._cached_view_conditions = [
+            torch.sin(
+                (i + 1) * torch.arange(1, self._latent_dim + 1).float() / self._latent_dim
+            )
+            for i in range(self._num_views)
+        ]
+
+        # Autoencoders
         self.autoencoders = nn.ModuleList([
             Autoencoder(arch, activation, config['Autoencoder']['batchnorm'])
             for arch, activation in zip(archs, activations)
         ])
+
+        # Diffusion models
         self.dfs = nn.ModuleList([
-            Unet(config['diffusion']['emb_size'], config['diffusion']['time_type'], out_dim)
+            Unet(
+                config['diffusion']['emb_size'],
+                config['diffusion']['time_type'],
+                out_dim
+            )
             for out_dim in out_dims
         ])
-        # Pass device to NoiseScheduler
+
+        # Noise scheduler (already device-aware)
         self.noise_scheduler = NoiseScheduler(
             config['noise_scheduler']['num_timesteps'],
             device=device
         )
-        self.clusterLayer = ClusterProject(self._latent_dim, config['training']['n_clusters'])
+
+        # Cluster + attention
+        self.clusterLayer = ClusterProject(
+            self._latent_dim,
+            config['training']['n_clusters']
+        )
+
         self.AttentionLayer = AttentionLayer(self._latent_dim)
 
-        for idx, autoencoder in enumerate(self.autoencoders[:2], start=1):
-            setattr(self, f'autoencoder{idx}', autoencoder)
-        for idx, diffusion in enumerate(self.dfs[:2], start=1):
-            setattr(self, f'df{idx}', diffusion)
-
+        self.to_device(device)
+      
+        
     def _parse_autoencoder_config(self, autoencoder_config, num_views=None):
         if 'archs' in autoencoder_config:
             archs = autoencoder_config['archs']
@@ -112,10 +133,8 @@ class DCG(nn.Module):
         }
 
     def _view_condition(self, batch_size, view_idx, device, dtype):
-        positions = torch.arange(1, self._latent_dim + 1, device=device, dtype=dtype)
-        phase = (view_idx + 1) * positions / float(self._latent_dim)
-        condition = torch.sin(phase).unsqueeze(0)
-        return condition.expand(batch_size, -1)
+        condition = self._cached_view_conditions[view_idx].to(device=device, dtype=dtype)
+        return condition.unsqueeze(0).expand(batch_size, -1)
 
     def _diffusion_forward(self, df, latent, timestep, view_idx):
         conditioned_latent = latent + 0.01 * self._view_condition(
@@ -143,10 +162,22 @@ class DCG(nn.Module):
         return torch.all(latent.std(dim=0) < self._degenerate_std_threshold).item()
 
     def _iter_batches(self, views, mask, batch_size):
-        shuffled = shuffle(*views, *[mask[:, idx] for idx in range(self._num_views)])
-        shuffled_views = list(shuffled[:self._num_views])
-        shuffled_masks = list(shuffled[self._num_views:])
+        use_torch = all(torch.is_tensor(v) for v in views) and torch.is_tensor(mask)
         total = views[0].shape[0]
+
+        if use_torch:
+            base_device = views[0].device
+            same_device = (mask.device == base_device) and all(v.device == base_device for v in views)
+            if same_device:
+                perm = torch.randperm(total, device=base_device)
+                shuffled_views = [v.index_select(0, perm) for v in views]
+                shuffled_masks = [mask[:, idx].index_select(0, perm) for idx in range(self._num_views)]
+            else:
+                use_torch = False
+        else:
+            shuffled = shuffle(*views, *[mask[:, idx] for idx in range(self._num_views)])
+            shuffled_views = list(shuffled[:self._num_views])
+            shuffled_masks = list(shuffled[self._num_views:])
 
         for start in range(0, total, batch_size):
             end = min(start + batch_size, total)
@@ -237,7 +268,7 @@ class DCG(nn.Module):
         }
         if optimizer is not None:
             payload['optimizer_state_dict'] = optimizer.state_dict()
-            torch.save(payload, checkpoint_path)
+        torch.save(payload, checkpoint_path)
 
     def _zero_loss(self, device):
         return torch.zeros(1, device=device).squeeze()
@@ -256,7 +287,6 @@ class DCG(nn.Module):
         )
 
         criterion_cluster = ClusterLoss(config['training']['n_clusters'], 0.5, device).to(device)
-
         best_acc, best_nmi, best_ari = 0, 0, 0
 
         training_cfg = config['training']
@@ -343,7 +373,7 @@ class DCG(nn.Module):
                     fused_observed = fused_latent[observed]
                     if self._is_degenerate_view(latent) or self._is_degenerate_view(fused_observed):
                         continue
-                    mmi_terms.append(MMI(fused_observed, latent))
+                    mmi_terms.append(MMI(fused_observed, F.softmax(latent, dim=1)))
                 mmi_loss = sum(mmi_terms) / len(mmi_terms) if mmi_terms else self._zero_loss(device)
 
                 # Cluster & HC loss
@@ -373,6 +403,7 @@ class DCG(nn.Module):
 
                 # Cross-view consistency loss
                 ce_terms = []
+                ce_criterion_cache = {}
                 stacked_latents = torch.stack(latent_bank, dim=0)
                 available_float = view_mask_tensor.to(stacked_latents.dtype)
                 masked_latents = stacked_latents * available_float.T.unsqueeze(-1)
@@ -389,11 +420,22 @@ class DCG(nn.Module):
                     source_sum = latent_sum - masked_latents[view_idx]
                     source_latent = source_sum.index_select(0, valid_indices) / source_count.index_select(0, valid_indices).unsqueeze(1).to(source_sum.dtype)
                     recovered_latent = self._recover_latent(source_latent, diffusion, view_idx, device, fast=True)
-                    criterion_instance = InstanceLoss(valid_count, 1.0, device).to(device)
-                    ce_terms.append(criterion_instance(recovered_latent, fused_latent.index_select(0, valid_indices).detach()))
+                    criterion_instance_local = ce_criterion_cache.get(valid_count)
+                    if criterion_instance_local is None:
+                        criterion_instance_local = InstanceLoss(valid_count, 1.0, device).to(device)
+                        ce_criterion_cache[valid_count] = criterion_instance_local
+                    ce_terms.append(
+                        criterion_instance_local(
+                            recovered_latent, 
+                            fused_latent.index_select(0, valid_indices).detach()
+                        )
+
+                    )
+
 
                 ce_loss = sum(ce_terms) / len(ce_terms) if ce_terms else self._zero_loss(device)
 
+                # Total loss
                 loss = (
                     loss_weights['rec'] * reconstruction_loss
                     + loss_weights['diff'] * diffusion_loss

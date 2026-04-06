@@ -1,3 +1,4 @@
+# DCG/configure.py
 def get_default_config(data_name):
     # Shared defaults
     base_config = dict(
@@ -6,6 +7,7 @@ def get_default_config(data_name):
         ),
         training=dict(
             seed=0,
+            data_seed=43,
             mask_seed=5,
             missing_rate=0.3,
             noise_scale=0.1,
