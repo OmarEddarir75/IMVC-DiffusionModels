@@ -273,7 +273,11 @@ class DCG(nn.Module):
     def _zero_loss(self, device):
         return torch.zeros(1, device=device).squeeze()
 
-    def train(self, config, *args, eval_callback=None, epoch_callback=None):
+    def train(self, config=None, *args, eval_callback=None, epoch_callback=None):
+        if config is None:
+            return super().train(True)
+        if isinstance(config, bool) and not args:
+            return super().train(config)
         # Parse training inputs
         views, Y_list, mask, optimizer, device = self._parse_train_args(args)
 
@@ -403,34 +407,34 @@ class DCG(nn.Module):
 
                 # Cross-view consistency loss
                 ce_terms = []
-                ce_criterion_cache = {}
-                stacked_latents = torch.stack(latent_bank, dim=0)
-                available_float = view_mask_tensor.to(stacked_latents.dtype)
-                masked_latents = stacked_latents * available_float.T.unsqueeze(-1)
-                latent_sum = masked_latents.sum(dim=0)
+                # ce_criterion_cache = {}
+                # stacked_latents = torch.stack(latent_bank, dim=0)
+                # available_float = view_mask_tensor.to(stacked_latents.dtype)
+                # masked_latents = stacked_latents * available_float.T.unsqueeze(-1)
+                # latent_sum = masked_latents.sum(dim=0)
 
-                for view_idx, diffusion in enumerate(self.dfs):
-                    target_observed = view_mask_tensor[:, view_idx]
-                    source_count = available_counts - target_observed.long()
-                    valid = target_observed & (source_count > 0)
-                    valid_count = int(valid.sum().item())
-                    if valid_count <= 1:
-                        continue
-                    valid_indices = valid.nonzero(as_tuple=True)[0]
-                    source_sum = latent_sum - masked_latents[view_idx]
-                    source_latent = source_sum.index_select(0, valid_indices) / source_count.index_select(0, valid_indices).unsqueeze(1).to(source_sum.dtype)
-                    recovered_latent = self._recover_latent(source_latent, diffusion, view_idx, device, fast=True)
-                    criterion_instance_local = ce_criterion_cache.get(valid_count)
-                    if criterion_instance_local is None:
-                        criterion_instance_local = InstanceLoss(valid_count, 1.0, device).to(device)
-                        ce_criterion_cache[valid_count] = criterion_instance_local
-                    ce_terms.append(
-                        criterion_instance_local(
-                            recovered_latent, 
-                            fused_latent.index_select(0, valid_indices).detach()
-                        )
+                # for view_idx, diffusion in enumerate(self.dfs):
+                #     target_observed = view_mask_tensor[:, view_idx]
+                #     source_count = available_counts - target_observed.long()
+                #     valid = target_observed & (source_count > 0)
+                #     valid_count = int(valid.sum().item())
+                #     if valid_count <= 1:
+                #         continue
+                #     valid_indices = valid.nonzero(as_tuple=True)[0]
+                #     source_sum = latent_sum - masked_latents[view_idx]
+                #     source_latent = source_sum.index_select(0, valid_indices) / source_count.index_select(0, valid_indices).unsqueeze(1).to(source_sum.dtype)
+                #     recovered_latent = self._recover_latent(source_latent, diffusion, view_idx, device, fast=True)
+                #     criterion_instance_local = ce_criterion_cache.get(valid_count)
+                #     if criterion_instance_local is None:
+                #         criterion_instance_local = InstanceLoss(valid_count, 1.0, device).to(device)
+                #         ce_criterion_cache[valid_count] = criterion_instance_local
+                #     ce_terms.append(
+                #         criterion_instance_local(
+                #             recovered_latent, 
+                #             fused_latent.index_select(0, valid_indices).detach()
+                #         )
 
-                    )
+                #     )
 
 
                 ce_loss = sum(ce_terms) / len(ce_terms) if ce_terms else self._zero_loss(device)
@@ -464,7 +468,7 @@ class DCG(nn.Module):
             if num_batches > 0:
                 # avg_loss = loss_all / num_batches
                 # scheduler.step(avg_loss)
-                scheduler.step(reconstruction_loss)
+                scheduler.step(reconstruction_loss.detach())
 
             if epoch % config['print_num'] == 0:
                 print(
