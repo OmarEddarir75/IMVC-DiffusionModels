@@ -185,6 +185,52 @@ class ClusterLoss(nn.Module):
 
 
 
+
+    def category_contrastive_loss(self, Q_list, tau_C=1.0):
+        """
+        Q_list: list of tensors shape (N, K) – soft assignments for each view.
+        Returns scalar loss.
+        """
+        n_views = len(Q_list)
+        if n_views < 2:
+            return torch.tensor(0.0, device=Q_list[0].device)
+        total_loss = 0.0
+        for m in range(n_views):
+            for n in range(n_views):
+                if m == n:
+                    continue
+                Q_m = Q_list[m]   # (N, K)
+                Q_n = Q_list[n]
+                # Compute cosine similarity between each column (cluster) across views
+                # Normalize columns to unit vectors for stable cosine similarity
+                Q_m_norm = F.normalize(Q_m, p=2, dim=0)   # (N, K)
+                Q_n_norm = F.normalize(Q_n, p=2, dim=0)
+                sim_matrix = torch.mm(Q_m_norm.T, Q_n_norm)   # (K, K)
+                # Positive pairs: diagonal elements
+                pos = torch.exp(torch.diag(sim_matrix) / tau_C)
+                # Negative pairs: off-diagonal elements
+                neg = torch.exp(sim_matrix / tau_C).sum(dim=1) - pos
+                loss_mn = -torch.log(pos / (pos + neg)).mean()
+                total_loss += loss_mn
+        return total_loss / (n_views * (n_views - 1))
+
+    def kl_clustering_loss(self, Q_fused, Q_views, temperature=1.0):
+        """
+        Q_fused: (N, K) soft assignments from fused representation.
+        Q_views: list of (N, K) soft assignments from each view.
+        """
+        # Stack all view assignments and compute mean (or max as in paper)
+        Q_stack = torch.stack(Q_views, dim=0)   # (V, N, K)
+        Q_mean = Q_stack.mean(dim=0)            # (N, K)
+        # High-confidence target: square and normalise (Eq. 19)
+        P = (Q_mean ** 2) / (Q_mean ** 2).sum(dim=1, keepdim=True)
+        # KL divergence between P and Q_fused
+        kl = (P * torch.log(P / (Q_fused + 1e-8))).sum(dim=1).mean()
+        return kl
+
+
+
+
 # def MMI(view1, view2):
 #     """Maximise cosine similarity between fused and single-view latents."""
 #     v1 = F.normalize(view1, dim=1)

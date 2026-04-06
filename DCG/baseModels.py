@@ -1,6 +1,5 @@
 # DCG/baseModels.py
 import torch
-import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -379,70 +378,24 @@ class AttentionLayer(nn.Module):
         return (weights.unsqueeze(-1) * h).sum(dim=1)
 
 class ClusterProject(nn.Module):
-    def __init__(self, latent_dim, n_clusters, init_mode='kmeans_plus_plus'):
-        super().__init__()
-        self.init_mode = init_mode
+    """Projection head for clustering."""
+    def __init__(self, latent_dim, n_clusters):
+        super(ClusterProject, self).__init__()
         self._latent_dim = latent_dim
         self._n_clusters = n_clusters
-        self.cluster = nn.Linear(latent_dim, n_clusters)
-        self.softmax = nn.Softmax(dim=1)
-
-    def initialize_centers(self, latents, labels=None):
-        from sklearn.cluster import KMeans
-        if self.init_mode == 'kmeans_plus_plus':
-            kmeans = KMeans(n_clusters=self._n_clusters, init='k-means++', random_state=0).fit(latents)
-            centres = kmeans.cluster_centers_
-        elif self.init_mode == 'random_subset':
-            idx = np.random.choice(len(latents), self._n_clusters, replace=False)
-            centres = latents[idx]
-        else:
-            return
-        with torch.no_grad():
-            self.cluster.weight.data = torch.from_numpy(centres).float()
-            if self.cluster.bias is not None:
-                self.cluster.bias.data.zero_()
+        self.cluster_projector = nn.Sequential(
+            nn.Linear(self._latent_dim, self._latent_dim),
+            nn.LayerNorm(self._latent_dim),
+            nn.ReLU(),
+        )
+        self.cluster = nn.Sequential(
+            nn.Linear(self._latent_dim, self._n_clusters),
+            # nn.Sigmoid(),
+            nn.Softmax(dim=1),
+        )
 
     def forward(self, x):
-        logits = self.cluster(x)
-        y = self.softmax(logits)
-        return y, x
-
-
-# class ClusterProject(nn.Module):
-#     """Projection head for clustering."""
-#     def __init__(self, latent_dim, n_clusters, init_mode='kmeans_plus_plus'):
-#         super(ClusterProject, self).__init__()
-#         self.init_mode = init_mode
-#         self._latent_dim = latent_dim
-#         self._n_clusters = n_clusters
-#         self.cluster_projector = nn.Sequential(
-#             nn.Linear(self._latent_dim, self._latent_dim),
-#             nn.LayerNorm(self._latent_dim),
-#             nn.ReLU(),
-#         )
-#         self.cluster = nn.Sequential(
-#             nn.Linear(self._latent_dim, self._n_clusters),
-#             # nn.Sigmoid(),
-#             nn.Softmax(dim=1),
-#         )
-
-#     def initialize_centers(self, latents, labels=None):
-#         """Set cluster centres using k‑means++ or random subset."""
-#         from sklearn.cluster import KMeans
-#         if self.init_mode == 'kmeans_plus_plus':
-#             kmeans = KMeans(n_clusters=self._n_clusters, init='k-means++', random_state=0).fit(latents)
-#             centres = kmeans.cluster_centers_
-#         elif self.init_mode == 'random_subset':
-#             idx = np.random.choice(len(latents), self._n_clusters, replace=False)
-#             centres = latents[idx]
-#         else:
-#             return
-#         # Set the weight of the linear layer to the centres
-#         with torch.no_grad():
-#             self.cluster[0].weight.data = torch.from_numpy(centres).float()
-
-#     def forward(self, x):
-#         z = self.cluster_projector(x)
-#         y = self.cluster(z)
-#         return y, z
+        z = self.cluster_projector(x)
+        y = self.cluster(z)
+        return y, z
 
