@@ -274,13 +274,13 @@ class DCG(nn.Module):
             'diff': training_cfg.get('diff_weight', 1.0),
             'ccl': training_cfg.get('ccl_weight', 1.0),   # category contrastive
             'kl': training_cfg.get('kl_weight', 1.0),     # KL divergence
-            'ce': training_cfg.get('ce_weight', 1.0),     # cross-view contrastive (optional)
+            'ce': training_cfg.get('ce_weight', 0.0),     # cross-view contrastive (optional)
         }
 
     def category_contrastive_loss(self, Q_list, tau_C=1.0):
         """
-        Category-level contrastive loss (Eq.16).
         Q_list: list of tensors shape (N, K) – soft assignments for each view.
+        Returns scalar loss.
         """
         n_views = len(Q_list)
         if n_views < 2:
@@ -292,36 +292,33 @@ class DCG(nn.Module):
                     continue
                 Q_m = Q_list[m]   # (N, K)
                 Q_n = Q_list[n]
-                # For each cluster j
-                loss_mn = 0.0
-                for j in range(self._n_clusters):
-                    # Positive: cosine similarity between the j-th column of Q_m and Q_n
-                    pos = torch.exp(F.cosine_similarity(Q_m[:, j], Q_n[:, j], dim=0) / tau_C)
-                    # Negative: sum over k != j
-                    neg_sum = 0.0
-                    for k in range(self._n_clusters):
-                        if k != j:
-                            neg_sum += torch.exp(F.cosine_similarity(Q_m[:, j], Q_n[:, k], dim=0) / tau_C)
-                    loss_mn -= torch.log(pos / (pos + neg_sum))
+                # Compute cosine similarity between each column (cluster) across views
+                # Normalize columns to unit vectors for stable cosine similarity
+                Q_m_norm = F.normalize(Q_m, p=2, dim=0)   # (N, K)
+                Q_n_norm = F.normalize(Q_n, p=2, dim=0)
+                sim_matrix = torch.mm(Q_m_norm.T, Q_n_norm)   # (K, K)
+                # Positive pairs: diagonal elements
+                pos = torch.exp(torch.diag(sim_matrix) / tau_C)
+                # Negative pairs: off-diagonal elements
+                neg = torch.exp(sim_matrix / tau_C).sum(dim=1) - pos
+                loss_mn = -torch.log(pos / (pos + neg)).mean()
                 total_loss += loss_mn
         return total_loss / (n_views * (n_views - 1))
 
     def kl_clustering_loss(self, Q_fused, Q_views, temperature=1.0):
         """
-        KL divergence loss (Eq.18-20).
-        Q_fused: soft assignments from fused representation (N, K)
-        Q_views: list of soft assignments from each view (N, K)
+        Q_fused: (N, K) soft assignments from fused representation.
+        Q_views: list of (N, K) soft assignments from each view.
         """
-        # Stack all assignments (fused + views)
-        Q_stack = torch.stack([Q_fused] + Q_views, dim=0)  # (V+1, N, K)
-        # High-confidence assignment: elementwise max (Eq.18)
-        Q_max = Q_stack.max(dim=0)[0]  # (N, K)
-        # Target distribution (Eq.19)
-        P = (Q_max ** 2) / (Q_max ** 2).sum(dim=1, keepdim=True)
-        P = P / temperature   # optional temperature scaling
-        # KL divergence between target and fused assignments (Eq.20)
+        # Stack all view assignments and compute mean (or max as in paper)
+        Q_stack = torch.stack(Q_views, dim=0)   # (V, N, K)
+        Q_mean = Q_stack.mean(dim=0)            # (N, K)
+        # High-confidence target: square and normalise (Eq. 19)
+        P = (Q_mean ** 2) / (Q_mean ** 2).sum(dim=1, keepdim=True)
+        # KL divergence between P and Q_fused
         kl = (P * torch.log(P / (Q_fused + 1e-8))).sum(dim=1).mean()
         return kl
+
 
     def train(self, config, *args, eval_callback=None, epoch_callback=None):
         views, Y_list, mask, optimizer, device = self._parse_train_args(args)
@@ -437,6 +434,21 @@ class DCG(nn.Module):
                 for latent in latent_bank:
                     Q_v, _ = self.clusterLayer(latent)
                     Q_views.append(Q_v)
+
+                # Check if fused assignments are degenerate (one cluster dominates)
+                if torch.any(Q_fused.sum(dim=0) < 1e-6) or torch.isnan(Q_fused).any():
+                    ccl_loss = self._zero_loss(device)
+                    kl_loss = self._zero_loss(device)
+                else:
+                    # Category contrastive loss
+                    if len(Q_views) >= 2:
+                        ccl_loss = self.category_contrastive_loss(Q_views, tau_C=1.0)
+                        # KL divergence loss
+                        kl_loss = self.kl_clustering_loss(Q_fused, Q_views)
+                    else:
+                        ccl_loss = self._zero_loss(device)
+                        kl_loss = self._zero_loss(device)
+
                 # Category contrastive loss
                 if len(Q_views) >= 2:
                     ccl_loss = self.category_contrastive_loss(Q_views, tau_C=1.0)
@@ -520,6 +532,7 @@ class DCG(nn.Module):
                     break
 
         return best_acc, best_nmi, best_ari
+
 
     def evaluation(self, config, *args):
         mask, views, Y_list, device = self._parse_eval_args(args)
