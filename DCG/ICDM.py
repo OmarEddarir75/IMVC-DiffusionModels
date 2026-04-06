@@ -358,8 +358,8 @@ class DCG(nn.Module):
                 if len(per_view_losses_tensor) > 0:
                     per_view_losses_tensor = torch.stack(per_view_losses_tensor)
                     reconstruction_loss = per_view_losses_tensor.mean()
-                    balance_loss = torch.var(per_view_losses_tensor)
-                    reconstruction_loss = reconstruction_loss + 0.1 * balance_loss
+                    # balance_loss = torch.var(per_view_losses_tensor)
+                    # reconstruction_loss = reconstruction_loss + 0.1 * balance_loss
                 else:
                     reconstruction_loss = self._zero_loss(device)
 
