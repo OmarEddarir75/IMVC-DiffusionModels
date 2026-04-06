@@ -72,13 +72,199 @@ class DCG(nn.Module):
 
         self.to_device(device)
 
-    # ---------- (all helper methods unchanged: _parse_autoencoder_config, _parse_diffusion_config,
-    #            _parse_train_args, _parse_eval_args, _empty_latent, _view_condition,
-    #            _diffusion_forward, _recover_latent, _is_degenerate_view, _iter_batches,
-    #            _diffusion_friendly_imputation, to_device, _compute_latent_codes,
-    #            _save_eval_checkpoint, _zero_loss) ----------
+    def _parse_autoencoder_config(self, autoencoder_config, num_views=None):
+        if 'archs' in autoencoder_config:
+            archs = autoencoder_config['archs']
+            activations = autoencoder_config.get('activations', 'relu')
+        else:
+            archs = get_indexed_config_values(autoencoder_config, 'arch')
+            activations = get_indexed_config_values(autoencoder_config, 'activations')
 
-    # We only show the changed methods: _get_loss_weights, train, and the two new loss functions.
+        archs = list(archs)
+        if num_views is not None:
+            archs = expand_per_view(archs, num_views)
+
+        if not isinstance(activations, (list, tuple)):
+            activations = [activations] * len(archs)
+        else:
+            activations = list(activations)
+            if num_views is not None:
+                activations = expand_per_view(activations, len(archs))
+
+        return archs, activations
+
+    def _parse_diffusion_config(self, diffusion_config, num_views=None):
+        if 'out_dims' in diffusion_config:
+            out_dims = list(diffusion_config['out_dims'])
+        else:
+            out_dims = get_indexed_config_values(diffusion_config, 'out_dim')
+
+        if num_views is not None:
+            out_dims = expand_per_view(out_dims, num_views)
+        return out_dims
+
+    def _parse_train_args(self, args):
+        if len(args) == 5 and isinstance(args[0], (list, tuple)):
+            views, Y_list, mask, optimizer, device = args
+            return list(views), Y_list, mask, optimizer, device
+        if len(args) == 6:
+            x1_train, x2_train, Y_list, mask, optimizer, device = args
+            return [x1_train, x2_train], Y_list, mask, optimizer, device
+        raise TypeError('train expects either (views, Y_list, mask, optimizer, device) or (x1, x2, Y_list, mask, optimizer, device).')
+
+    def _parse_eval_args(self, args):
+        if len(args) == 4 and isinstance(args[1], (list, tuple)):
+            mask, views, Y_list, device = args
+            return mask, list(views), Y_list, device
+        if len(args) == 5:
+            mask, x1_train, x2_train, Y_list, device = args
+            return mask, [x1_train, x2_train], Y_list, device
+        raise TypeError('evaluation expects either (mask, views, Y_list, device) or (mask, x1, x2, Y_list, device).')
+
+    def _empty_latent(self, device):
+        return torch.empty((0, self._latent_dim), device=device)
+
+    def _view_condition(self, batch_size, view_idx, device, dtype):
+        condition = self._cached_view_conditions[view_idx].to(device=device, dtype=dtype)
+        return condition.unsqueeze(0).expand(batch_size, -1)
+
+    def _diffusion_forward(self, df, latent, timestep, view_idx):
+        conditioned_latent = latent + 0.01 * self._view_condition(
+            latent.shape[0], view_idx, latent.device, latent.dtype
+        )
+        return df(conditioned_latent, timestep)
+
+    def _recover_latent(self, latent, df, view_idx, device, fast=False):
+        if latent.size(0) == 0:
+            return latent
+        recovered = latent
+        num_steps = len(self.noise_scheduler)
+        max_steps = 50 if fast else num_steps
+        start_step = num_steps - 1
+        for t in range(start_step, start_step - max_steps, -1):
+            timestep = torch.full((recovered.shape[0],), t, dtype=torch.long, device=device)
+            with torch.no_grad():
+                denoised = self._diffusion_forward(df, recovered, timestep, view_idx)
+            recovered = self.noise_scheduler.step(denoised, timestep, recovered)
+        return recovered
+
+    def _is_degenerate_view(self, latent):
+        if latent.size(0) <= 1:
+            return True
+        return torch.all(latent.std(dim=0) < self._degenerate_std_threshold).item()
+
+    def _iter_batches(self, views, mask, batch_size):
+        use_torch = all(torch.is_tensor(v) for v in views) and torch.is_tensor(mask)
+        total = views[0].shape[0]
+
+        if use_torch:
+            base_device = views[0].device
+            same_device = (mask.device == base_device) and all(v.device == base_device for v in views)
+            if same_device:
+                perm = torch.randperm(total, device=base_device)
+                shuffled_views = [v.index_select(0, perm) for v in views]
+                shuffled_masks = [mask[:, idx].index_select(0, perm) for idx in range(self._num_views)]
+            else:
+                use_torch = False
+        else:
+            shuffled = shuffle(*views, *[mask[:, idx] for idx in range(self._num_views)])
+            shuffled_views = list(shuffled[:self._num_views])
+            shuffled_masks = list(shuffled[self._num_views:])
+
+        for start in range(0, total, batch_size):
+            end = min(start + batch_size, total)
+            batch_views = [view[start:end] for view in shuffled_views]
+            batch_masks = [view_mask[start:end] for view_mask in shuffled_masks]
+            yield batch_views, batch_masks
+
+    def _diffusion_friendly_imputation(self, batch_views, batch_masks, noise_scale):
+        imputed_views = []
+        for batch_view, batch_mask in zip(batch_views, batch_masks):
+            imputed_view = batch_view.clone()
+            observed = batch_mask == 1
+            missing = ~observed
+            if not missing.any():
+                imputed_views.append(imputed_view)
+                continue
+
+            if observed.any():
+                observed_mean = batch_view[observed].mean(dim=0, keepdim=True)
+            else:
+                observed_mean = batch_view.mean(dim=0, keepdim=True)
+
+            if noise_scale > 0:
+                noise = torch.randn(
+                    (int(missing.sum().item()), batch_view.shape[1]),
+                    device=batch_view.device,
+                    dtype=batch_view.dtype
+                ) * noise_scale
+                imputed_view[missing] = observed_mean + noise
+            else:
+                imputed_view[missing] = observed_mean.expand(int(missing.sum().item()), -1)
+
+            imputed_views.append(imputed_view)
+        return imputed_views
+
+    def to_device(self, device):
+        self._device = device
+        self.autoencoders.to(device)
+        self.dfs.to(device)
+        self.clusterLayer.to(device)
+        self.AttentionLayer.to(device)
+        self.noise_scheduler.to_device(device)
+
+    def _compute_latent_codes(self, mask, views, device):
+        num_samples = views[0].shape[0]
+        latent_codes = [torch.zeros(num_samples, self._latent_dim, device=device) for _ in range(self._num_views)]
+
+        for view_idx, (autoencoder, batch_view) in enumerate(zip(self.autoencoders, views)):
+            observed = mask[:, view_idx] == 1
+            if observed.any():
+                latent_codes[view_idx][observed] = autoencoder.encoder(batch_view[observed])
+
+        for target_idx, diffusion in enumerate(self.dfs):
+            missing = mask[:, target_idx] == 0
+            if not missing.any():
+                continue
+
+            source_count = (mask[:, torch.arange(self._num_views, device=device) != target_idx] == 1).sum(dim=1)
+            valid_missing = missing & (source_count > 0)
+            if not valid_missing.any():
+                continue
+
+            fused_source = torch.zeros(valid_missing.sum(), self._latent_dim, device=device)
+            for source_idx in range(self._num_views):
+                if source_idx == target_idx:
+                    continue
+                source_available = valid_missing & (mask[:, source_idx] == 1)
+                if source_available.any():
+                    fused_source[source_available[valid_missing]] += latent_codes[source_idx][source_available]
+            fused_source = fused_source / source_count[valid_missing].unsqueeze(1).to(fused_source.dtype)
+            latent_codes[target_idx][valid_missing] = self._recover_latent(fused_source, diffusion, target_idx, device)
+
+        return latent_codes
+
+    def _save_eval_checkpoint(self, config, epoch, scores, optimizer=None):
+        training_cfg = config['training']
+        checkpoint_dir = Path(training_cfg.get('checkpoint_dir', Path('DCG') / 'checkpoints'))
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        checkpoint_path = checkpoint_dir / f"icdm_eval_epoch{epoch}.pt"
+
+        payload = {
+            'epoch': epoch,
+            'scores': scores,
+            'autoencoders_state_dict': self.autoencoders.state_dict(),
+            'dfs_state_dict': self.dfs.state_dict(),
+            'attention_state_dict': self.AttentionLayer.state_dict(),
+            'cluster_state_dict': self.clusterLayer.state_dict(),
+        }
+        if optimizer is not None:
+            payload['optimizer_state_dict'] = optimizer.state_dict()
+        torch.save(payload, checkpoint_path)
+
+    def _zero_loss(self, device):
+        return torch.zeros(1, device=device).squeeze()
+
 
     def _get_loss_weights(self, config):
         training_cfg = config['training']
